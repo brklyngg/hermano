@@ -28,4 +28,4 @@ locked to OpenAI Realtime — that's where the model quality lives, and Realtime
 has no cross-vendor equivalent we'd accept on parity. The agent backend
 remains portable, but the contract is moving toward MCP: today the sidecar
 forwards to chat-completions; the next phase exposes a remote MCP surface
-(`ask_hermes`) that any MCP-speaking backend can implement.
+(`ask_agent`) that any MCP-speaking backend can implement.

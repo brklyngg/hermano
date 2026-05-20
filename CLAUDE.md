@@ -52,6 +52,7 @@ node --check web/app.js
 | `search_notes(query, k)` | 100–3000ms | function | `backends.notes` (ripgrep) |
 | `calendar(when, account)` | ~500ms | function | `backends.gws` (gws-as.sh) |
 | `gmail_search(query, account, limit)` | 500–1500ms | function | `backends.gws` |
+| `recall_recent_call(conv_id, query?)` | ~10ms | function | `backends.transcripts_recall` (local files) |
 | `deep_research(prompt, scope, expected_seconds)` | 30–240s | SSE | agent backend |
 
 `deep_research` covers both *thinking* (reasoning/drafting/synthesis) and *doing* (actions with side effects: filesystem writes, Gmail drafts, Calendar writes, scripts) — the agent backend has the tools. Scope arg is `action|drafting|reasoning|synthesis`. For "save this to ~/Desktop/foo.md" or similar, the model calls `deep_research` with `scope=action` and the agent executes.
@@ -67,7 +68,7 @@ Per-tool TTL cache in `server.py:_TOOL_TTL` keyed on `(tool, args_hash)` via `ba
 
 **Dossier refresh + post-call working-state extraction:**
 - `dossier.refresh_dossier()`: one agent call with a JSON-only directive → atomic write to `DOSSIER_PATH`. 30-min debounce; `force=True` bypasses. Schema: `{open_loops, calendar_today, recent_decisions, hot_people, last_handoff_summary, working_state_from_last_call}`.
-- `dossier.extract_working_state(conv_id, entries)`: one agent call after a call ends → `{decisions, commitments, open_questions, deltas}` merged into the dossier. This is the cross-call continuity loop — the next session's instructions carry what we just decided/committed/learned.
+- `dossier.extract_working_state(conv_id, entries, started_at)`: one agent call after a call ends produces *three* outputs from one transcript pass: `{decisions, commitments, open_questions, deltas}` merged into the dossier (cross-call continuity); `voice_learnings[]` appended to `VOICE_MEMORY_VOICE_PATH` as `§`-separated paragraphs (enduring lessons across all future calls — corrections, preferences, style); and `call_one_liner` upserted into `VOICE_MEMORY_TRANSCRIPT_INDEX_PATH` so the next session's instructions carry a compact map of prior calls (model expands any entry on demand via `recall_recent_call`).
 - Local-date gating (`DOSSIER_TZ`, default America/New_York): when the on-disk dossier was generated on a prior local date (first call after midnight, etc.) it's *still* served to the in-flight session — `load_dossier()` prepends a `> Standing context — snapshot from <date>; today's regen in progress.` header rather than returning `None`. Mint never blocks on dossier and additionally kicks a background `refresh_dossier(force=True)` so the next session lands fresh (self-healing on day rollover). `session_minted` carries `dossier_stale`, `dossier_chars`, `instructions_chars`, and `instructions_hash` (sha1[:12]) so prompt drift across calls is auditable.
 
 **`triage_verdict` (opt-in via `?mode=triage`):**
@@ -81,6 +82,14 @@ Realtime sessions hard-die at the 60-min cap; mobile resumes (visibility, networ
 
 **Hard cutover on legacy `/api/ask-agent`:** returns 410 `{error:"client_outdated", reload_required:true}`. The `no_cache_static_middleware` already forces shell revalidation; one reload restores normal operation. Stale-cache fallthrough into the slow path is exactly the regression the toolkit refactor exists to kill.
 
+**Shared memory contract (`voice_memory.py`):**
+The voice chat reads up to three external memory files via the `VOICE_MEMORY_*` env registry (`USER_PROFILE`, `SHARED`, `VOICE`) plus a transcript index. Defaults are all empty so the public quickstart needs no external memory. Personal deployments wire these to an existing agent's memory bank (e.g. `~/.hermes/memories/{USER,MEMORY,VOICE}.md`).
+
+- **Read-only from this codebase**: `USER_PROFILE` and `SHARED`. The voice chat ingests them as opaque markdown and prepends them to instructions under their configured `## <header>`. Format drift in the source files (e.g. Hermes upstream renaming or restructuring) is graceful — we don't parse, we splice.
+- **Voice-owned (writable)**: `VOICE_MEMORY_VOICE_PATH` and `VOICE_MEMORY_TRANSCRIPT_INDEX_PATH`. Atomic writes via tempfile+rename. Never edit these manually during an in-flight call (last-writer-wins race on close).
+- **`ingest_into_agent` continues to fire** in parallel with the new VOICE.md loop. The two are complementary: the agent backend gets the raw transcript via the existing ingest call; the voice-owned VOICE.md is the structured, prompt-injected, voice-side learning loop. Do not delete `ingest_into_agent` on the assumption they're redundant.
+- **Post-call extraction covers abrupt endings**: both `/api/end` and the `_reap_stale_conversations` reaper call `dossier.schedule_extract`, which now produces all three outputs (dossier working state, voice learnings, transcript-index entry). Calls that end without `/api/end` (driving, signal loss) still feed the learning loop via the reaper path within `REAPER_IDLE_TIMEOUT_SEC`.
+
 **Concurrency hazards handled:**
 - `responseInFlight` tracking gates handoff-note requests (Realtime allows only one response at a time).
 - Mute state preserved across resume by re-applying `track.enabled = false` after `attachPeer`.
@@ -89,8 +98,9 @@ Realtime sessions hard-die at the 60-min cap; mobile resumes (visibility, networ
 ## Key files
 
 - `server.py` — sidecar; routes (`/api/session`, `/api/tool/{name}`, `/api/deep-research`, `/api/text-turn`, `/api/resume`, `/api/premint-session`, `/api/handoff-note`, `/api/end`, `/api/client-event`, `/api/triage-verdict`, `/api/health`). `/api/ask-agent` returns 410.
-- `dossier.py` — structured dossier schema, `render_markdown`, `load_dossier`, `refresh_dossier`, `extract_working_state`, fire-and-forget schedulers.
-- `backends/` — `supabase` (Mission Control), `gws` (Calendar/Gmail), `notes` (Obsidian/ripgrep), `cache` (TTL memo). Pure async functions; designed so Phase D can lift them into an MCP server unchanged.
+- `dossier.py` — structured dossier schema, `render_markdown`, `load_dossier`, `refresh_dossier`, `extract_working_state` (also produces voice_learnings + call_one_liner), fire-and-forget schedulers.
+- `voice_memory.py` — env-driven memory-source registry, voice-owned learnings file, transcript-index helpers. All-optional; public default is empty.
+- `backends/` — `supabase` (Mission Control), `gws` (Calendar/Gmail), `notes` (Obsidian/ripgrep), `transcripts_recall` (local-file recall_recent_call backend), `cache` (TTL memo), `stub_agent` (in-process canned-response stub for `AGENT_API_BASE=stub://`). Pure async functions; designed so Phase D can lift them into an MCP server unchanged.
 - `web/app.js` — WebRTC peer + DC switch (`onDcMessage`), per-tool consulting chips, `dispatchToolCall` table, `handleNarrowTool`, `handleDeepResearch` (SSE reader + system-message milestone injection), `handleTriageVerdict`, forced-reconnect machinery.
 - `events.py` — NDJSON logger; `compute_routing_metrics` derives per-tool counters/latencies, `deep_research_ratio`, `in_context_followup_rate`.
 - `transcripts.py` — end-of-call persistence + optional Slack archive.

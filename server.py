@@ -35,6 +35,7 @@ load_dotenv(HERE / ".env")
 
 from auth import tailnet_middleware  # noqa: E402
 import dossier  # noqa: E402
+import voice_memory  # noqa: E402
 from events import log_call_event, compute_routing_metrics  # noqa: E402
 from transcripts import write_transcript, ingest_into_agent, post_to_slack  # noqa: E402
 
@@ -76,8 +77,11 @@ if not AGENT_API_KEY:
     if _key_file.exists():
         AGENT_API_KEY = _key_file.read_text().strip()
 
-if not AGENT_API_KEY:
-    log.warning("AGENT_API_KEY not set - /api/ask-agent will 500")
+if not AGENT_API_KEY and not (os.getenv("AGENT_API_BASE", "").startswith("stub://")):
+    log.warning(
+        "AGENT_API_KEY not set - dossier refresh, deep_research, and post-call "
+        "extraction will be skipped. Set AGENT_API_BASE=stub:// for quickstart."
+    )
 if not OPENAI_API_KEY:
     log.warning("OPENAI_API_KEY not in env - /api/session will 500")
 
@@ -276,6 +280,31 @@ DEEP_RESEARCH_TOOL_SCHEMA = {
     },
 }
 
+RECALL_RECENT_CALL_SCHEMA = {
+    "type": "function",
+    "name": "recall_recent_call",
+    "description": (
+        "Pull an excerpt from a prior voice call's transcript. Use ONLY when the "
+        "user references a specific recent conversation and the recent-calls map "
+        "in your instructions has a matching conv_id. Don't fish; if the relevant "
+        "conv_id isn't in the map, ask the user to remind you what call they mean."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "conv_id": {
+                "type": "string",
+                "description": "The conv_id from the §Recent voice calls list in your instructions.",
+            },
+            "query": {
+                "type": "string",
+                "description": "Optional substring to filter the transcript by (case-insensitive).",
+            },
+        },
+        "required": ["conv_id"],
+    },
+}
+
 TOOLKIT_SCHEMAS = [
     LOOKUP_OPEN_LOOP_SCHEMA,
     RECENT_DECISIONS_SCHEMA,
@@ -283,6 +312,7 @@ TOOLKIT_SCHEMAS = [
     CALENDAR_SCHEMA,
     GMAIL_SEARCH_SCHEMA,
     MISSION_CONTROL_CARD_SCHEMA,
+    RECALL_RECENT_CALL_SCHEMA,
     DEEP_RESEARCH_TOOL_SCHEMA,
 ]
 
@@ -531,6 +561,11 @@ async def _agent_chat_stream(conv_id: str, user_text: str):
       - Caller wraps in asyncio.wait_for(ASK_AGENT_TIMEOUT_SEC) for the outer
         runaway guard.
     """
+    from backends import stub_agent
+    if stub_agent.is_stub():
+        async for chunk in stub_agent.stream(user_text):
+            yield chunk
+        return
     if not AGENT_API_KEY:
         raise RuntimeError("Agent API key not configured")
     timeout = httpx.Timeout(
@@ -724,7 +759,15 @@ async def session_mint(request: web.Request) -> web.Response:
             agent_base=AGENT_API_BASE, agent_key=AGENT_API_KEY, force=True,
         ))
     triage_suffix = _load_open_loops_brief() if mode == "triage" else None
-    suffixes = [dossier_md, triage_suffix]
+    # Memory sources (env-driven registry): user profile, shared assistant
+    # memory, voice-learnings file — each optional, skipped silently when
+    # unconfigured. Public default loads nothing; personal deployments wire
+    # these via .env to local memory files. Transcript-index map appended last
+    # so the model has a compact list of prior calls reachable via
+    # recall_recent_call.
+    memory_blocks = voice_memory.render_memory_sources_markdown()
+    transcript_index_block = voice_memory.render_transcript_index_markdown()
+    suffixes = [dossier_md, triage_suffix, *memory_blocks, transcript_index_block]
     try:
         data = await _mint_realtime_session(instructions_suffixes=suffixes)
     except httpx.HTTPStatusError as e:
@@ -734,6 +777,14 @@ async def session_mint(request: web.Request) -> web.Response:
         log.exception("ephemeral mint exception")
         return web.json_response({"error": "ephemeral_mint_exception", "detail": str(e)}, status=502)
     instructions_chars, instructions_hash = _instructions_audit(suffixes)
+    instructions_tokens_est = instructions_chars // 4
+    memory_sources_loaded = [b["header"] for b in voice_memory.load_memory_sources()]
+    memory_total_chars = sum(len(b) for b in memory_blocks)
+    if instructions_tokens_est > 12000:
+        log.warning(
+            "session_minted: instructions ~%d tokens — approaching 16,384 cap (conv=%s)",
+            instructions_tokens_est, conv_id,
+        )
     log_call_event(
         LOG_DIR, conv_id, "session_minted",
         model=OPENAI_REALTIME_MODEL, voice=OPENAI_REALTIME_VOICE,
@@ -743,7 +794,11 @@ async def session_mint(request: web.Request) -> web.Response:
         dossier_age_h=dossier_meta["age_h"],
         dossier_stale=dossier_meta.get("stale", False),
         working_state_present=dossier_meta["working_state_present"],
+        memory_sources_loaded=memory_sources_loaded,
+        memory_total_chars=memory_total_chars,
+        transcript_index_present=bool(transcript_index_block),
         instructions_chars=instructions_chars,
+        instructions_tokens_est=instructions_tokens_est,
         instructions_hash=instructions_hash,
     )
     return web.json_response({"conv_id": conv_id, "session": data, "mode": mode or "default"})
@@ -799,12 +854,13 @@ async def ask_agent_gone(request: web.Request) -> web.Response:
 # below imports lazily so missing backend deps (e.g. ripgrep absent) don't
 # crash mint — they only surface when the tool fires.
 _TOOL_DISPATCH = {
-    "lookup_open_loop":     ("backends.supabase", "lookup_open_loop"),
-    "recent_decisions":     ("backends.supabase", "recent_decisions"),
-    "mission_control_card": ("backends.supabase", "mission_control_card"),
-    "search_notes":         ("backends.notes",    "search_notes"),
-    "calendar":             ("backends.gws",      "calendar"),
-    "gmail_search":         ("backends.gws",      "gmail_search"),
+    "lookup_open_loop":     ("backends.supabase",           "lookup_open_loop"),
+    "recent_decisions":     ("backends.supabase",           "recent_decisions"),
+    "mission_control_card": ("backends.supabase",           "mission_control_card"),
+    "search_notes":         ("backends.notes",              "search_notes"),
+    "calendar":             ("backends.gws",                "calendar"),
+    "gmail_search":         ("backends.gws",                "gmail_search"),
+    "recall_recent_call":   ("backends.transcripts_recall", "recall_recent_call"),
 }
 
 # Per-tool cache TTLs (seconds). Calendar and Gmail need shorter windows so
@@ -817,6 +873,7 @@ _TOOL_TTL = {
     "mission_control_card": 180.0,
     "recent_decisions": 300.0,
     "search_notes": 300.0,
+    "recall_recent_call": 300.0,
 }
 
 
@@ -1170,12 +1227,13 @@ async def end_call(request: web.Request) -> web.Response:
         agent_base=AGENT_API_BASE,
         agent_key=AGENT_API_KEY,
     ))
-    # Extract working state from this call, then refresh the dossier so the
-    # next session sees both. Ordering matters: extract → refresh; never
-    # blocks the live response.
+    # Extract working state + voice learnings + one-liner from this call, then
+    # refresh the dossier so the next session sees both. Ordering matters:
+    # extract → refresh; never blocks the live response.
     dossier.schedule_extract(
         conv_id, all_entries,
         agent_base=AGENT_API_BASE, agent_key=AGENT_API_KEY,
+        started_at=conv["started_at"],
     )
     slack_posted = False
     if SLACK_BOT_TOKEN and SLACK_CALL_CHANNEL_ID:
@@ -1251,10 +1309,12 @@ async def _reap_stale_conversations() -> None:
                 ))
                 slack_posted = True
             # Same extract → refresh chain as end_call. Idle-reaped calls still
-            # produce signal worth carrying forward to the next session.
+            # produce signal worth carrying forward to the next session — this
+            # is the path that covers abrupt endings (driving, signal loss).
             dossier.schedule_extract(
                 cid, all_entries,
                 agent_base=AGENT_API_BASE, agent_key=AGENT_API_KEY,
+                started_at=conv["started_at"],
             )
             log.info("reaped idle conversation %s (>%dmin no activity)", cid, REAPER_IDLE_TIMEOUT_SEC // 60)
             log_call_event(

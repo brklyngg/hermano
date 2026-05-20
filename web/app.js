@@ -198,13 +198,14 @@ function fadeOutConsultingChip(div) {
 // seam is bad UX). Each entry pulls a topic out of the streaming args buffer
 // so the chip can live-update as the model formulates the call.
 const TOOL_CHIPS = {
-  lookup_open_loop:     { idle: "Looking up that loop…",    key: "id" },
-  recent_decisions:     { idle: "Pulling recent decisions…", key: "days", prefix: "Recent decisions (last " , suffix: "d)" },
-  search_notes:         { idle: "Searching your notes…",    key: "query", prefix: "Searching notes: " },
-  calendar:             { idle: "Checking your calendar…",  key: "when",  prefix: "Calendar: " },
-  gmail_search:         { idle: "Searching email…",         key: "query", prefix: "Email: " },
-  mission_control_card: { idle: "Pulling that card…",       key: "id" },
-  deep_research:        { idle: "Researching…",             key: "prompt", prefix: "Researching: " },
+  lookup_open_loop:     { idle: "Looking up that loop…",       key: "id" },
+  recent_decisions:     { idle: "Pulling recent decisions…",    key: "days", prefix: "Recent decisions (last " , suffix: "d)" },
+  search_notes:         { idle: "Searching your notes…",        key: "query", prefix: "Searching notes: " },
+  calendar:             { idle: "Checking your calendar…",      key: "when",  prefix: "Calendar: " },
+  gmail_search:         { idle: "Searching email…",             key: "query", prefix: "Email: " },
+  mission_control_card: { idle: "Pulling that card…",           key: "id" },
+  recall_recent_call:   { idle: "Pulling up that earlier call…", key: "query", prefix: "Recalling: " },
+  deep_research:        { idle: "Researching…",                 key: "prompt", prefix: "Researching: " },
 };
 
 // Pull a string arg value from a partial-JSON args buffer. Args stream in
@@ -923,6 +924,7 @@ function sendFunctionOutput(call_id, output) {
 const NARROW_TOOLS = new Set([
   "lookup_open_loop", "recent_decisions", "search_notes",
   "calendar", "gmail_search", "mission_control_card",
+  "recall_recent_call",
 ]);
 
 function dispatchToolCall(callId, name, args) {

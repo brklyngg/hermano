@@ -248,6 +248,14 @@ async def _agent_call_json(prompt: str, *, agent_base: str, agent_key: str,
     Returns the parsed dict on success, None on any failure (network, parse,
     auth, etc.). Never raises — caller treats None as "skip this refresh."
     """
+    # Stub-backend short-circuit: no HTTP, return canned JSON. Lets quickstart
+    # run dossier refresh + post-call extraction without a real agent backend.
+    try:
+        from backends import stub_agent
+        if stub_agent.is_stub():
+            return await stub_agent.call_json(prompt)
+    except Exception:  # noqa: BLE001
+        log.exception("dossier: stub_agent route failed")
     if not agent_key:
         log.warning("dossier: no agent key — skipping refresh")
         return None
@@ -411,7 +419,7 @@ async def refresh_dossier(*, agent_base: str, agent_key: str,
 
 
 EXTRACT_WORKING_STATE_PROMPT = """\
-Extract Gary's working state from the voice-call transcript below as a single JSON object.
+Extract the user's working state from the voice-call transcript below as a single JSON object.
 
 Return ONLY valid JSON matching this schema (no prose, no markdown fences):
 
@@ -419,17 +427,33 @@ Return ONLY valid JSON matching this schema (no prose, no markdown fences):
   "decisions": [{{"text": str}}],
   "commitments": [{{"text": str}}],
   "open_questions": [{{"text": str}}],
-  "deltas": [{{"text": str}}]
+  "deltas": [{{"text": str}}],
+  "voice_learnings": [{{"kind": "correction|preference|style|pattern|fact", "body": str}}],
+  "call_one_liner": str
 }}
 
 Definitions:
-- decisions: concrete things Gary decided during this call ("we're shipping X by Friday", "kill the Y feature").
-- commitments: things Gary or the assistant committed to doing next ("draft the email", "call Pat tomorrow").
-- deltas: changes in Gary's mental model — beliefs updated, assumptions overturned, plans revised.
+- decisions: concrete things decided during this call ("ship X by Friday", "kill the Y feature").
+- commitments: things the user or the assistant committed to doing next ("draft the email", "call Pat tomorrow").
+- deltas: changes in the user's mental model — beliefs updated, assumptions overturned, plans revised.
 - open_questions: things explicitly left unresolved or flagged for later.
+- voice_learnings: ENDURING lessons about how to be a better voice colleague for THIS user across all future calls.
+  Only include genuinely persistent, voice-specific signal. Examples by kind:
+    correction: user explicitly corrected the assistant ("no, X is actually Y", "stop doing Z")
+    preference: stated style/format/pace preference ("be more terse", "don't ask before acting on email drafts")
+    style: communication-style observations the assistant should adopt going forward
+    pattern: recurring behavior worth remembering ("user starts every call by asking about today's calendar")
+    fact: a durable fact about the user's world that wasn't already captured elsewhere
+  DO NOT classify routine decisions/commitments here — those go in `decisions`/`commitments`.
+  DO NOT include one-off frustrations, transient tool failures, or speculative observations.
+  When in doubt, leave it out — sparse is fine; an empty list is the right answer for most calls.
+- call_one_liner: one short sentence summarizing what the call was about, ≤120 chars.
+  Phrased so a stranger reading the index 3 months later could decide whether to pull the full transcript.
+  Example: "Triaged Tech Week event list; decided to skip Concourse breakfast in favor of finance-AI mixer."
 
-Caps: ≤10 decisions, ≤10 commitments, ≤8 deltas, ≤8 open_questions.
-Each item ≤200 chars. If a section has no entries, return [].
+Caps: ≤10 decisions, ≤10 commitments, ≤8 deltas, ≤8 open_questions, ≤5 voice_learnings.
+Each text field ≤200 chars (call_one_liner ≤120).
+If a section has no entries, return [].
 Skip greetings, small talk, tool dumps, and procedural chatter — only signal worth carrying forward.
 
 Transcript:
@@ -454,8 +478,11 @@ def _format_transcript_for_extraction(entries: list[dict]) -> str:
 
 
 async def extract_working_state(conv_id: str, entries: list[dict], *,
-                                agent_base: str, agent_key: str) -> dict | None:
-    """Read the just-ended call's transcript, extract working state, merge into dossier.
+                                agent_base: str, agent_key: str,
+                                started_at: float | None = None) -> dict | None:
+    """Read the just-ended call's transcript, extract three things in one call:
+    working state (merged into dossier), voice learnings (appended to
+    VOICE.md), and a call one-liner (upserted into the transcript index).
 
     Fires async from end_call and the reaper — never blocks the live path.
     Returns the updated `working_state_from_last_call` dict on success, None
@@ -484,6 +511,32 @@ async def extract_working_state(conv_id: str, entries: list[dict], *,
     log.info("dossier: working_state updated for conv=%s (d=%d c=%d q=%d Δ=%d)",
              conv_id, len(new_ws["decisions"]), len(new_ws["commitments"]),
              len(new_ws["open_questions"]), len(new_ws["deltas"]))
+    # Route voice learnings + one-liner to voice_memory. Both are no-ops when
+    # the relevant env paths aren't configured, so this is safe in any deploy.
+    try:
+        import voice_memory
+        learnings = data.get("voice_learnings")
+        if isinstance(learnings, list) and learnings:
+            paragraphs = []
+            for item in learnings[:5]:
+                if not isinstance(item, dict):
+                    continue
+                body = (item.get("body") or "").strip()
+                if not body:
+                    continue
+                kind = (item.get("kind") or "fact").strip()
+                paragraphs.append(f"{kind}: {body}")
+            voice_memory.append_voice_learning(paragraphs, conv_id=conv_id)
+        one_liner = (data.get("call_one_liner") or "").strip()
+        if started_at is not None:
+            voice_memory.update_transcript_index(
+                conv_id=conv_id,
+                started_at=started_at,
+                duration_s=max(0, int(time.time() - started_at)),
+                one_liner=one_liner,
+            )
+    except Exception:  # noqa: BLE001
+        log.exception("voice_memory routing failed for conv=%s", conv_id)
     return new_ws
 
 
@@ -500,14 +553,23 @@ def schedule_refresh(*, agent_base: str, agent_key: str, force: bool = False) ->
 
 def schedule_extract(conv_id: str, entries: list[dict], *,
                      agent_base: str, agent_key: str,
-                     then_refresh: bool = True) -> None:
+                     then_refresh: bool = True,
+                     started_at: float | None = None) -> None:
     """Spawn the post-call extractor; optionally chain a dossier refresh.
 
     The chain matters: refresh-then-mint would race with extract-then-merge.
     Sequencing extract → refresh ensures the next session sees both updates.
+
+    `started_at` flows through so the transcript-index entry has accurate
+    duration. Omitted for callers that don't track it; voice_memory will
+    silently skip the index update.
     """
     async def _run():
-        await extract_working_state(conv_id, entries, agent_base=agent_base, agent_key=agent_key)
+        await extract_working_state(
+            conv_id, entries,
+            agent_base=agent_base, agent_key=agent_key,
+            started_at=started_at,
+        )
         if then_refresh:
             await refresh_dossier(agent_base=agent_base, agent_key=agent_key, force=True)
     try:

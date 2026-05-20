@@ -11,6 +11,10 @@ secrets.json
 # Runtime data
 logs/
 transcripts/
+.voice-memory/
+
+# Internal-only docs (handoffs, debug logs, deep-context dumps)
+docs/private/
 
 # Python
 __pycache__/

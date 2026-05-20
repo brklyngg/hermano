@@ -38,19 +38,45 @@ So I built the smaller half of the gap myself.
 
 The personal version is called Hermes Mini. The open-source version I'm releasing today is **Talk to Your Context**.
 
-Architecturally it's a small stack:
+Architecturally it's a small stack, and the shape changed once I'd lived with it for a few weeks. The first cut funneled every substantive turn through a single slow `ask_agent` call. It worked, but it was wrong: most questions don't *need* the full agent loop, they need one specific piece of context delivered fast. So I split it.
 
 - **Browser PWA ↔ OpenAI Realtime over WebRTC.** Handles barge-in, natural turn-taking, conversational feel. The Realtime model is the fast, shallow brain.
-- **Function bridge to my actual agent.** When a question is substantive, the Realtime model calls `ask_agent`, which routes through the full agent loop — skills, retrieval, tools, memory. That's where the context lives.
-- **A "thinking" affordance.** Brown noise + a visual cue while the deep call runs. Honest about the latency rather than hiding it.
+- **A dossier baked into every session.** When the call mints, the model's instructions already contain today's calendar, open loops, recent decisions, the people I've been talking to, and the working state from the last call. That's the difference between "generic until deep dive" and "knows what I'm working on from second 1."
+- **A narrow toolkit, 50ms–1.5s.** Direct backends for the fast stuff: look up a specific card by ID, pull the calendar, search email, grep the notes vault, recall an excerpt from a prior call. No LLM in the path. The model picks the right one — often several in parallel — based on the dossier.
+- **One slow path, `deep_research`.** Reserved for genuinely novel reasoning, drafting, or side-effecting work. Streams milestones back mid-call so the voice narrates progress instead of going dark. Brown noise covers the rare hard wait.
+- **Memory sources, optional.** A small env-driven registry lets me wire the voice chat into my existing personal-assistant memory bank (user profile, shared facts, voice-specific learnings) without touching code. Empty by default for anyone cloning the repo.
+- **A post-call learning loop.** The same agent call that updates the next session's dossier also extracts enduring voice-specific learnings — corrections, preferences, style notes — and a one-line summary into a recent-calls index. Including when the call ends abruptly (driving, signal drop). The thing learns, and never starts from scratch.
 - **Text-mode fallback.** For when I want to type, or for long answers I'd rather read than hear.
-- **Transcript persistence + post-call ingestion.** Every call gets saved as JSON; a summary gets folded back into the agent's memory so the *next* call starts where this one ended. The thing learns.
 - **Optional Slack archive.** Each call becomes a private Slack thread, searchable like any other channel.
 - **Tailnet-only by default.** Loopback or Tailscale CIDR allowlist. Private by default. Not internet-exposed.
 
-The defining design choice is splitting the brain. Realtime model for turn-taking; real agent for substance. Most consumer voice products won't ship this because of the visible latency on deep calls — and that's the right call for them. It is the wrong call for me, because I'm not asking the live voice what the weather is. I'm asking it to think with me.
+The defining design choice is the split between fast and slow paths and the dossier that makes the fast paths feel substantive. Most consumer voice products land the conversation but skip the context layer. That's the right tradeoff for them. It is the wrong tradeoff for me, because I'm not asking the live voice what the weather is. I'm asking it to think with me about the thing I'm in the middle of.
 
-[GARY: optional concrete moment — one real brainstorming session this enabled. Half a paragraph. Lands harder than feature bullets.]
+### One concrete moment: Tech Week prep
+
+NYC Tech Week was the week I knew the architecture was earning its keep.
+
+I drove into the city with a half-formed question — "what should I actually be doing for Tech Week?" — and got back, on the first turn, a ranked list of events tied to my actual GTM goals, not generic NYC startup advice. The dossier had already loaded my Crunchy Numbers positioning, the customer-acquisition wedge I'd committed to that week, my calendar (multiple accounts), and the recent decisions journal. One narrow `calendar` call reconciled what I was already booked into. One `gmail_search` surfaced the confirmation emails for the ticketed events. One `search_notes` pulled the strategy memo I'd written days earlier and forgotten about.
+
+The output was a four-event plan with a clear rationale per event and a polite-skip suggestion for two more — phrased like a colleague who'd been on the prior planning call, because in a real sense it had.
+
+Shallow voice would have given me a generic networking checklist. This gave me a schedule-aware plan tied to decisions I'd already made.
+
+### Another moment: catching up on a half-remembered thread
+
+A few days later I asked, while pacing the apartment, "Can you catch me up on that QuantumCT thing again?" — a thread I'd let go stale for two weeks.
+
+The voice recovered the prior fractional-CFO conversation, corrected my drift (I'd half-remembered QuantumCT as a VC; it's actually a young Connecticut nonprofit/public-private quantum hub), then ran a `deep_research` call to layer in fresh public material. Halfway through the research it narrated, "still pulling — should have the funding-model breakdown in another minute" so I knew it hadn't stalled. The synthesis landed on a concrete wedge I hadn't seen before: a grant-readiness and restricted-funds diagnostic, which is *exactly* the kind of finance-ops work I'm strong at.
+
+Shallow voice would have asked me to restate the backstory or hallucinated a generic venture-capital pitch. This grounded the entity correctly, used the prior conversation, and only reached for the slow path when it actually needed to.
+
+### A third: a half-formed YC question on the train
+
+"What should I say and do around YC and Tech Week?" — same kind of half-baked ask.
+
+The model pulled my Crunchy Numbers/YC positioning decisions from the journal, scanned recent Gmail for accelerator and customer signals, reconciled the calendar against the target event list, and ran a brief `deep_research` to synthesize a focused set of asks for three specific events (Vertical AI in Accounting, a CFO breakfast, a finance-agent meetup). The output was three specific conversations to drive, not platitudes about networking.
+
+That's the whole point. Half-baked question in; grounded plan out, in under thirty seconds for the fast bits and a bounded slow path for the part that actually needed synthesis.
 
 ## What works, and what doesn't
 
@@ -62,10 +88,10 @@ A few things I underestimated:
 
 What's still imperfect, said honestly:
 
-- **Deep-context calls lag.** Five to twenty seconds depending on the question. There's no way around this with current architectures — context retrieval plus agent loop takes real wall time. The brown-noise affordance helps but doesn't eliminate the friction. This is probably why ChatGPT Live Voice doesn't ship this architecture: the latency would feel broken to a general audience. For the brainstorming use case, I'll wait eight seconds for an answer that knows my world.
+- **`deep_research` calls lag.** Thirty seconds to a few minutes depending on the question. There's no way around this with current architectures — substantive synthesis takes real wall time. The mid-call milestone narration helps ("still pulling, should have the next section soon") but doesn't eliminate the friction. The fix was tighter triage — most questions don't need the slow path, the dossier and narrow toolkit cover them — but the rare hard one still costs real time. For the brainstorming use case, that's a price I'll pay.
 - **Single-user.** Auth is local-first. Multi-user with proper isolation is a different product.
-- **Local-first assumption.** You need to be running a local agent with an OpenAI-compatible API. That's a specific kind of person's setup. (Hermes is the documented default; the adapters layer means it's not the only option.)
-- **Transcript ingestion is summary-quality, not verbatim.** Good enough for me. Might not be for everyone.
+- **You bring your own backends.** The narrow toolkit ships as adapters — a default Supabase-shaped journal, a Google Workspace adapter, ripgrep over a notes directory, a transcript-recall backend. There's a bundled stub backend for the slow path so you can smoke-test the full stack in 60 seconds without standing anything up. Real answers need a real backend you wire in.
+- **Memory is opt-in.** The voice chat can read an existing personal-memory bank if you point it at one (user profile, shared facts, voice-specific learnings) and writes back to a voice-owned learnings file post-call. All four paths default empty. Mine is wired into the agent I already run, which is why the voice chat feels like a continuation; for someone cloning the repo, it'll feel like a clean agent until they wire it.
 
 ## A note on agent harnesses
 
@@ -79,7 +105,7 @@ That distinction is the one I'd want a reader to take away. Context is leverage.
 
 [`github.com/brklyngg/talk-to-your-context`](https://github.com/brklyngg/talk-to-your-context) — MIT, give-it-away.
 
-Default backend is Hermes (because that's what I run). The adapters layer means you can plug in any local agent that exposes an OpenAI-compatible chat-completions endpoint — `ollama serve`, vLLM, your own thing. There are README stubs for swapping the Slack transcript archive to Telegram, Discord, Matrix, or email. If you build an adapter, send a PR.
+There's a bundled in-process stub backend so you can run the full stack in 60 seconds with just an OpenAI API key. When you're ready for real answers, point `AGENT_API_BASE` at any OpenAI-compatible chat-completions SSE endpoint — your own agent, `ollama serve`, vLLM, whatever. The narrow toolkit ships with adapter stubs you replace with your own data sources. There are README stubs for swapping the Slack transcript archive to Telegram, Discord, Matrix, or email. If you build an adapter, send a PR.
 
 I'm releasing it as a freebie because the tools that taught me to build were freebies. Open source is its own pay-it-forward economy and I'd like to be in it. If you make something better with this, I want to hear about it.
 

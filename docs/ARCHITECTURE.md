@@ -5,9 +5,10 @@ A live, interruptible voice line to your own agent. The pieces:
 - **Browser PWA** (`web/`, vanilla JS) — UI + WebRTC peer to OpenAI.
 - **OpenAI Realtime API** — voice (`gpt-realtime-2`, GPT-5-class reasoning, 128K context, native parallel function calling, native preambles + async function calling). Browser holds a direct WebRTC peer with OpenAI; audio never transits the sidecar.
 - **Sidecar** (`server.py`, aiohttp) — mints OpenAI ephemeral sessions, dispatches the granular toolkit to direct backends, streams `deep_research`, owns conversation state, persists transcripts.
-- **Dossier** (`dossier.py` + `~/.hermes/dossier/today.json`) — structured "today's standing context" (open loops, calendar, recent decisions, hot people, last call's working state) regenerated on boot and after every call. Rendered as markdown and injected into every session's instructions. This is what makes the voice agent feel deeply contextual from second 1 instead of "generic until deep dive."
-- **Direct backends** (`backends/`) — `supabase` (Mission Control cards/journal), `gws` (Calendar/Gmail via the `gws-as.sh` wrapper), `notes` (Obsidian vault via ripgrep), `cache` (TTL memo). No LLM in the dispatch path — narrow tool calls land in 50ms–1.5s.
-- **Your agent backend** — anything exposing an OpenAI-compatible `/v1/chat/completions` SSE endpoint. Receives a per-conversation `X-Session-Id: voice-{conv_id}` header. Now reached only via `deep_research` (the one slow tool), the dossier refresher, and the post-call working-state extractor. (Phase D: small tools migrate to remote MCP transport via Tailscale Funnel — see end of doc.)
+- **Dossier** (`dossier.py` + `$DOSSIER_PATH`) — structured "today's standing context" (open loops, calendar, recent decisions, hot people, last call's working state) regenerated on boot and after every call. Rendered as markdown and injected into every session's instructions. This is what makes the voice agent feel deeply contextual from second 1 instead of "generic until deep dive."
+- **Memory sources** (`voice_memory.py`) — an env-driven registry of optional file-backed memory blocks (user profile, shared assistant memory, voice-owned learnings) plus a recent-calls transcript index. Empty by default; personal deployments wire in any subset via `.env`. The voice-owned learnings file is written on every call end by the same agent call that updates the dossier.
+- **Direct backends** (`backends/`) — `supabase` (default reference backend for cards/journal-style records), `gws` (Google Calendar/Gmail adapter), `notes` (local filesystem search via ripgrep), `transcripts_recall` (local-file backend for `recall_recent_call`), `cache` (TTL memo), `stub_agent` (in-process canned-response backend for `AGENT_API_BASE=stub://`). No LLM in the dispatch path — narrow tool calls land in 50ms–1.5s.
+- **Your agent backend** — anything exposing an OpenAI-compatible `/v1/chat/completions` SSE endpoint. Receives a per-conversation `X-Session-Id: voice-{conv_id}` header. Reached only via `deep_research` (the one slow tool), the dossier refresher, and the post-call working-state extractor. Set `AGENT_API_BASE=stub://` to use the bundled stub for quickstart.
 - **Optional messaging adapter** — Slack today; see [ADAPTERS.md](ADAPTERS.md).
 
 ## The durable conversation
@@ -25,8 +26,9 @@ Backgrounding is a **pause**, not an end. Only the explicit End button or `pageh
 ```
 ┌── browser PWA ──┐                 ┌── sidecar (server.py) ─────────────┐
 │ WebRTC peer    ─┼── ephemeral ────│ /api/session         mint conv_id  │
-│ (disposable)   │     key per      │ /api/ask-agent       sync forward  │
-│                │     session      │ /api/text-turn       typing path   │
+│ (disposable)   │     key per      │ /api/tool/<name>     narrow tools  │
+│                │     session      │ /api/deep-research   SSE slow path │
+│                │                  │ /api/text-turn       typing path   │
 │                │                  │ /api/resume          fresh peer key│
 │                │                  │ /api/premint-session 60-min cap    │
 │                │                  │ /api/handoff-note    save note     │
@@ -98,14 +100,15 @@ Per-call NDJSON at `logs/calls/<conv_id>.ndjson`. One line per event. `cat | jq`
 
 Events:
 
-- `session_minted`, `session_preminted`, `resumed`, `handoff_note_saved`
-- `ask_agent_spawned`, `ask_agent_done` (with `intent_type`, `freshness_required`, `latency_ms`)
+- `session_minted` (now carries `memory_sources_loaded`, `instructions_tokens_est`, plus the original dossier audit fields), `session_preminted`, `resumed`, `handoff_note_saved`
+- `tool_call_spawned`, `tool_call_done` (with `tool`, `latency_ms`, `cache_hit`, `error_type`)
+- `deep_research_spawned`, `deep_research_done`
 - `text_turn`
-- `tool_error`, `legacy_background_end_ignored`
+- `tool_error`, `legacy_background_end_ignored`, `legacy_ask_agent_blocked`
 - `client_dc_opened`, `client_session_cap_swap`, `client_resume_first_audio`
 - `reaped`, `ended`
 
-`compute_routing_metrics` (`events.py`) derives the headline split: `ask_agent_count` (escalations) vs `local_answer_turns` (in-session answers) vs `ask_ratio`. Watch this post-cutover — gpt-realtime-2's improved reasoning should reduce the ratio significantly.
+`compute_routing_metrics` (`events.py`) derives the headline metric — `in_context_followup_rate`: the fraction of user turns immediately after a tool answer that were served without another tool call. The dossier + narrow toolkit exist to push this metric upward; targets are ≥0.6 dossier-only and ≥0.8 full toolkit.
 
 ## Reaper
 
@@ -118,8 +121,8 @@ Polls every 60s. Conversations with no activity for 20min are reaped: transcript
 ## Tradeoffs
 
 - **No ICE restart.** Full reconnect (mint a fresh ephemeral, build a new peer) is ~1-2 s and works for both backgrounding and network handover. ICE restart is an optimization that requires SDP renegotiation surface OpenAI hasn't documented — not worth the complexity.
-- **Sync ask_agent (no task IDs / long-poll).** gpt-realtime-2's native preambles + async function calling fill the wait. The pre-cutover task-survival machinery (server-side asyncio.Task surviving client disconnect, `still_working` reattach on resume, `delivered_to_realtime` claim flag) is gone. Soft regression: a forced reconnect mid-tool-call leaves the question hanging — model may need to re-ask. Watch NDJSON for orphaned `ask_agent_spawned` events without matching `ask_agent_done`; reintroduce a thin "result by call_id cache, hold 60s post-disconnect" if real.
-- **Realtime + separate brain rather than monolithic.** Voice latency and persona stay tight on `gpt-realtime-2`; substantive cognition stays with the agent backend (full memory, skills, tool access). The two are bridged by the `ask_agent` proxy today.
+- **Narrow tools + one slow path, no monolithic agent proxy.** The pre-cutover architecture funneled every substantive turn through a single `/api/ask-agent` route to the backend; that's now 410'd. Today's substantive cognition is split across direct-backend narrow tools (50ms–1.5s, no LLM in path) and `deep_research` (the slow path, ≥30s, streaming SSE). The model picks the right tool from the dossier; narrow calls hit local backends in parallel, and `deep_research` reaches the agent backend only for genuinely novel reasoning, drafting, or side-effecting work.
+- **Soft regression on forced reconnect mid-`deep_research`.** Async function calling means in-flight tool calls die with the peer. Watch NDJSON for orphaned `deep_research_spawned` events without matching `_done`; reintroduce a thin "result by call_id cache, hold 60s post-disconnect" if real.
 - **No mid-call Slack updates.** Slack thread is a single post at end-of-call (or reap). Per-turn pings are noisy and the user can read the transcript locally.
 
 ## Phase D (deferred): remote-MCP transport for narrow tools
