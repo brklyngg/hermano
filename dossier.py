@@ -537,6 +537,11 @@ async def extract_working_state(conv_id: str, entries: list[dict], *,
             )
     except Exception:  # noqa: BLE001
         log.exception("voice_memory routing failed for conv=%s", conv_id)
+    try:
+        import honcho_voice
+        honcho_voice.record_call_facts(conv_id, new_ws)
+    except Exception:  # noqa: BLE001
+        log.exception("honcho_voice routing failed for conv=%s", conv_id)
     return new_ws
 
 

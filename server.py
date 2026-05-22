@@ -36,6 +36,7 @@ load_dotenv(HERE / ".env")
 from auth import tailnet_middleware  # noqa: E402
 import dossier  # noqa: E402
 import voice_memory  # noqa: E402
+import honcho_voice  # noqa: E402
 from events import log_call_event, compute_routing_metrics  # noqa: E402
 from transcripts import write_transcript, ingest_into_agent, post_to_slack  # noqa: E402
 
@@ -767,7 +768,14 @@ async def session_mint(request: web.Request) -> web.Response:
     # recall_recent_call.
     memory_blocks = voice_memory.render_memory_sources_markdown()
     transcript_index_block = voice_memory.render_transcript_index_markdown()
-    suffixes = [dossier_md, triage_suffix, *memory_blocks, transcript_index_block]
+    honcho_block = honcho_voice.render_mint_context_block(conv_id)
+    suffixes = [dossier_md, triage_suffix, honcho_block, *memory_blocks, transcript_index_block]
+    # Guard the Realtime 16,384-token instructions cap. If the Honcho block
+    # would push us over ~14k tokens, drop it rather than fail the mint.
+    if sum(len(s or "") for s in suffixes) // 4 > 14000 and honcho_block:
+        log.warning("dropping honcho_block to stay under instructions cap (conv=%s)", conv_id)
+        suffixes = [dossier_md, triage_suffix, *memory_blocks, transcript_index_block]
+        honcho_block = ""
     try:
         data = await _mint_realtime_session(instructions_suffixes=suffixes)
     except httpx.HTTPStatusError as e:
@@ -796,6 +804,7 @@ async def session_mint(request: web.Request) -> web.Response:
         working_state_present=dossier_meta["working_state_present"],
         memory_sources_loaded=memory_sources_loaded,
         memory_total_chars=memory_total_chars,
+        honcho_chars=len(honcho_block or ""),
         transcript_index_present=bool(transcript_index_block),
         instructions_chars=instructions_chars,
         instructions_tokens_est=instructions_tokens_est,
