@@ -350,24 +350,26 @@ def _extract_json_object(text: str) -> dict | None:
 
 # ---- public refresh / extract ----
 
-DOSSIER_REFRESH_PROMPT = """\
-Generate Gary's standing-context dossier as a single JSON object. Today is {today_iso}, TZ {tz}.
+_OPERATOR_NAME = os.getenv("OPERATOR_NAME", "the user").strip() or "the user"
+
+DOSSIER_REFRESH_PROMPT = f"""\
+Generate {_OPERATOR_NAME}'s standing-context dossier as a single JSON object. Today is {{today_iso}}, TZ {{tz}}.
 
 Return ONLY valid JSON matching this schema (no prose, no markdown fences):
 
-{{
-  "open_loops": [{{"id": str, "title": str, "column": str, "priority": "high"|"medium"|"normal"|"low"}}],
-  "calendar_today": [{{"start": "HH:MM", "end": "HH:MM", "title": str, "attendees": [str]}}],
-  "recent_decisions": [{{"date": "YYYY-MM-DD", "decision": str, "context": str}}],
-  "hot_people": [{{"name": str, "role": str, "recent_context": str}}],
+{{{{
+  "open_loops": [{{{{"id": str, "title": str, "column": str, "priority": "high"|"medium"|"normal"|"low"}}}}],
+  "calendar_today": [{{{{"start": "HH:MM", "end": "HH:MM", "title": str, "attendees": [str]}}}}],
+  "recent_decisions": [{{{{"date": "YYYY-MM-DD", "decision": str, "context": str}}}}],
+  "hot_people": [{{{{"name": str, "role": str, "recent_context": str}}}}],
   "last_handoff_summary": str
-}}
+}}}}
 
 Source data:
 - open_loops: live Mission Control cards not in done/archived columns. Use the real card UUIDs as `id`.
-- calendar_today: today's events from Gary's primary calendar.
+- calendar_today: today's events from {_OPERATOR_NAME}'s primary calendar.
 - recent_decisions: last 7 days of meaningful decisions from memory/journals.
-- hot_people: people Gary has been actively engaged with this week (e.g., investors, clients, key collaborators).
+- hot_people: people {_OPERATOR_NAME} has been actively engaged with this week (e.g., investors, clients, key collaborators).
 - last_handoff_summary: ≤80 words on where the last voice call left off (continuation note).
 
 Caps: ≤25 open_loops (priority-ordered), ≤10 calendar events, ≤8 recent_decisions, ≤6 hot_people.

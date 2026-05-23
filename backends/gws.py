@@ -22,12 +22,12 @@ from typing import Any
 log = logging.getLogger("ttyc.backends.gws")
 
 GWS_WRAPPER = Path(os.path.expanduser("~/scripts/gws-as.sh"))
-DEFAULT_ACCOUNT = os.getenv("GWS_DEFAULT_ACCOUNT", "gurevich.gary@gmail.com")
+# Both empty by default — a public clone with no GWS config registers no
+# Google Workspace tools and silently falls through if anything calls them.
+# Personal deployments set both in .env. ALLOWED_ACCOUNTS is comma-separated.
+DEFAULT_ACCOUNT = os.getenv("GWS_DEFAULT_ACCOUNT", "").strip()
 ALLOWED_ACCOUNTS = {
-    "gary@crunchy.tools",
-    "gary@flowocity.ai",
-    "gurevich.gary@gmail.com",
-    "jerome.cbmb@gmail.com",
+    a.strip() for a in os.getenv("GWS_ALLOWED_ACCOUNTS", "").split(",") if a.strip()
 }
 
 

@@ -22,6 +22,7 @@ let dc = null;             // data channel "oai-events"
 let micStream = null;
 let convId = null;
 let sessionMode = "default"; // "default" | "triage" — drives the first-response opener
+let operatorName = "the user"; // populated from /api/session response; used in narration prompts
 let started = false;
 let micMuted = false;
 let audioCtx = null;
@@ -416,6 +417,7 @@ async function startCall() {
   }
   convId = session.conv_id;
   sessionMode = session.mode || "default";
+  operatorName = session.operator_name || "the user";
   try {
     await attachPeer(session, null);
   } catch (e) {
@@ -1028,7 +1030,7 @@ async function handleDeepResearch(callId, args) {
             conversation: "none",
             output_modalities: ["audio"],
             instructions:
-              `Briefly tell Gary what you just found, in one short sentence. ` +
+              `Briefly tell ${operatorName} what you just found, in one short sentence. ` +
               `Section: ${section}. Finding: ${text}. ` +
               `Don't summarize the whole research — just this one update. ` +
               `Stay conversational; don't restate the user's question.`,
@@ -1259,6 +1261,7 @@ textForm.addEventListener("submit", async (ev) => {
       const r = await fetch(sessionEndpoint(), { method: "POST" });
       const d = await r.json();
       convId = d.conv_id;
+      operatorName = d.operator_name || operatorName;
     } catch (e) {
       appendBubble("system", `Session mint failed: ${e.message}`);
       return;

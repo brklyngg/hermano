@@ -31,6 +31,7 @@ log = logging.getLogger("ttyc.honcho_voice")
 
 CONFIG_PATH = Path(os.getenv("HONCHO_CONFIG_PATH", "~/.honcho/config.json")).expanduser()
 PEER_ID = os.getenv("HONCHO_PEER_ID", "gary")
+_OPERATOR_NAME = os.getenv("OPERATOR_NAME", "the user").strip() or "the user"
 ASSISTANT_PEER_ID = os.getenv("HONCHO_ASSISTANT_PEER_ID", "hermes")
 BLOCK_CHAR_CAP = 1500
 CONTEXT_TOKEN_BUDGET = 1500  # what we ask Honcho to give us; truncated again locally
@@ -136,7 +137,7 @@ def render_mint_context_block(conv_id: str) -> str:
                     continue
         if peer_card:
             card_str = "\n".join(f"- {fact}" for fact in peer_card)
-            parts.append(f"### Gary peer card\n{card_str}")
+            parts.append(f"### {_OPERATOR_NAME} peer card\n{card_str}")
 
         # Peer representation: prefer session-level (has session-relevant focus);
         # fall back to peer-level for cold starts.
@@ -149,7 +150,7 @@ def render_mint_context_block(conv_id: str) -> str:
             except Exception:
                 pass
         if peer_rep:
-            parts.append(f"### Gary, as Honcho models him\n{peer_rep}")
+            parts.append(f"### {_OPERATOR_NAME}, as Honcho models them\n{peer_rep}")
 
         if len(parts) == 1:  # only header, nothing useful
             return ""

@@ -16,6 +16,10 @@ transcripts/
 # Internal-only docs (handoffs, debug logs, deep-context dumps)
 docs/private/
 
+# Personal marketing / release drafts (blog posts, LinkedIn copy, etc.)
+# Lives in your CMS / Obsidian, not in the public repo.
+content/
+
 # Python
 __pycache__/
 *.pyc

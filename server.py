@@ -55,6 +55,14 @@ log = logging.getLogger("ttyc.server")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2")
 OPENAI_REALTIME_VOICE = os.getenv("OPENAI_REALTIME_VOICE", "alloy")
+# Operator's first name — used in prompts and tool-schema descriptions so the
+# model addresses them naturally instead of saying "the user". Default keeps
+# the public scaffold clean; personal deployments set this in .env.
+OPERATOR_NAME = os.getenv("OPERATOR_NAME", "the user").strip() or "the user"
+# Comma- or space-separated proper nouns the audio transcriber should bias
+# toward. Improves recognition of names/jargon you say often (people, products,
+# acronyms). Empty default; personal deployments populate via .env.
+OPENAI_REALTIME_TRANSCRIPTION_HINTS = os.getenv("OPENAI_REALTIME_TRANSCRIPTION_HINTS", "").strip()
 AGENT_API_BASE = os.getenv("AGENT_API_BASE", "http://127.0.0.1:8642").rstrip("/")
 # Liveness model for ask_agent forwards:
 #   - ASK_AGENT_IDLE_TIMEOUT_SEC: primary watchdog, surfaced via httpx's `read`
@@ -187,7 +195,7 @@ CALENDAR_SCHEMA = {
             },
             "account": {
                 "type": "string",
-                "description": "One of: gurevich.gary@gmail.com, gary@crunchy.tools, gary@flowocity.ai. Defaults to personal.",
+                "description": "The Google Workspace account to query (one of those configured via GWS_ALLOWED_ACCOUNTS). Omit to use the default.",
             },
         },
         "required": [],
@@ -208,7 +216,7 @@ GMAIL_SEARCH_SCHEMA = {
             "query": {"type": "string", "description": "Gmail search syntax"},
             "account": {
                 "type": "string",
-                "description": "One of: gurevich.gary@gmail.com, gary@crunchy.tools, gary@flowocity.ai.",
+                "description": "The Google Workspace account to query (one of those configured via GWS_ALLOWED_ACCOUNTS). Omit to use the default.",
             },
             "limit": {"type": "integer", "description": "Max results (1–25)", "default": 10},
         },
@@ -242,7 +250,7 @@ DEEP_RESEARCH_TOOL_SCHEMA = {
         "calendar events, edit notes, run scripts) AND novel reasoning, "
         "drafting, or synthesis. The agent backend has full filesystem access, "
         "Gmail draft / Calendar write, and shell tools — use this tool for any "
-        "user request that requires *doing* something on Gary's Mac, not just "
+        f"user request that requires *doing* something on {OPERATOR_NAME}'s machine, not just "
         "looking something up. Typically 30–240 seconds. Tell the user roughly "
         "how long ('this'll take about a minute, I'll narrate as I go'). Partial "
         "findings stream in via `[research-finding]` system messages — narrate "
@@ -306,7 +314,7 @@ RECALL_RECENT_CALL_SCHEMA = {
     },
 }
 
-TOOLKIT_SCHEMAS = [
+_ALL_TOOLKIT_SCHEMAS = [
     LOOKUP_OPEN_LOOP_SCHEMA,
     RECENT_DECISIONS_SCHEMA,
     SEARCH_NOTES_SCHEMA,
@@ -322,10 +330,10 @@ TRIAGE_VERDICT_TOOL_SCHEMA = {
     "type": "function",
     "name": "triage_verdict",
     "description": (
-        "Record Gary's verdict on an open loop the moment a decision is reached. "
-        "DEFAULT TO 'drop' if Gary signals indifference, fatigue, or vague intent. "
-        "Only use 'park' for items he explicitly defers with a reason. "
-        "Only use 'act' when he commits to a concrete next step with a date/time. "
+        f"Record {OPERATOR_NAME}'s verdict on an open loop the moment a decision is reached. "
+        f"DEFAULT TO 'drop' if {OPERATOR_NAME} signals indifference, fatigue, or vague intent. "
+        "Only use 'park' for items they explicitly defer with a reason. "
+        "Only use 'act' when they commit to a concrete next step with a date/time. "
         "Strategic discipline: maintenance/curiosity loops should drop unless they "
         "concretely unlock revenue, distribution, authority, or compounding capability."
     ),
@@ -334,7 +342,7 @@ TRIAGE_VERDICT_TOOL_SCHEMA = {
         "properties": {
             "loop_id": {"type": "string", "description": "The ol_<hash> ID from the briefing"},
             "verdict": {"type": "string", "enum": ["drop", "park", "act"]},
-            "next_action": {"type": "string", "description": "For 'act' only: the concrete next step Gary stated"},
+            "next_action": {"type": "string", "description": f"For 'act' only: the concrete next step {OPERATOR_NAME} stated"},
             "calendar_when": {"type": "string", "description": "For 'act' only: ISO datetime or natural language"},
             "note": {"type": "string", "description": "Optional brief context"},
         },
@@ -392,7 +400,7 @@ def _load_open_loops_brief() -> str | None:
         return None
 
 
-_TRIAGE_GUARDRAILS = """\
+_TRIAGE_GUARDRAILS = f"""\
 TRIAGE TOOL RULES — overrides toolkit defaults:
 - The context for every loop is RIGHT HERE in the brief (BLUF + source blob).
   Read both fields. Don't fetch.
@@ -408,8 +416,8 @@ TRIAGE TOOL RULES — overrides toolkit defaults:
   it and move on — that's already the doctrine. Don't research your way out.
 
 TRIAGE PRESENTATION (overrides the brief's "BLUF in <=8 words"):
-- Rule 9b (CONTEXT-SUFFICIENCY) wins. Gary has many parallel threads — a
-  fragment title is not enough for him to recall what a loop is about.
+- Rule 9b (CONTEXT-SUFFICIENCY) wins. {OPERATOR_NAME} has many parallel threads — a
+  fragment title is not enough for them to recall what a loop is about.
 - For each loop, before asking for a verdict, give 1–3 sentences of grounding
   pulled from the loop's `BLUF`, `source_blob`, scoring metadata (age, score,
   surfaced count), and surrounding signal: what it's about, why it surfaced,
@@ -761,12 +769,12 @@ async def _mint_realtime_session(
         if s and s.strip():
             parts.append(s.strip())
     instructions = "\n\n".join(parts)
-    transcription_prompt = (
-        "Gary Gurevich, Crunchy Numbers, Crunchy Tools, Flowocity, Hermes, "
-        "Jerome, Claude, OpenClaw, Paperclip, Rillet, Pat Leahy, "
-        "Y Combinator, Obsidian, Supabase, Vercel, Tailscale, fractional CFO, "
-        "P&L, GL, RFS, AI-native agency."
-    )
+    transcription_cfg: Dict[str, Any] = {
+        "model": "gpt-4o-mini-transcribe",
+        "language": "en",
+    }
+    if OPENAI_REALTIME_TRANSCRIPTION_HINTS:
+        transcription_cfg["prompt"] = OPENAI_REALTIME_TRANSCRIPTION_HINTS
     body = {
         "session": {
             "type": "realtime",
@@ -780,11 +788,7 @@ async def _mint_realtime_session(
                 "input": {
                     "format": {"type": "audio/pcm", "rate": 24000},
                     "noise_reduction": {"type": "near_field"},
-                    "transcription": {
-                        "model": "gpt-4o-mini-transcribe",
-                        "language": "en",
-                        "prompt": transcription_prompt,
-                    },
+                    "transcription": transcription_cfg,
                     "turn_detection": {
                         "type": "semantic_vad",
                         "eagerness": "low",
@@ -941,7 +945,10 @@ async def session_mint(request: web.Request) -> web.Response:
         dedupe_dropped_lines=dedupe_dropped_lines,
         packet_ref=packet_ref,
     )
-    return web.json_response({"conv_id": conv_id, "session": data, "mode": mode or "default"})
+    return web.json_response({
+        "conv_id": conv_id, "session": data, "mode": mode or "default",
+        "operator_name": OPERATOR_NAME,
+    })
 
 
 _AGENT_UNREACHABLE_SENTINEL = "Agent is temporarily unreachable"
@@ -993,7 +1000,7 @@ async def ask_agent_gone(request: web.Request) -> web.Response:
 # Dispatch table: tool name → (backend module, function name). The handler
 # below imports lazily so missing backend deps (e.g. ripgrep absent) don't
 # crash mint — they only surface when the tool fires.
-_TOOL_DISPATCH = {
+_ALL_TOOL_DISPATCH = {
     "lookup_open_loop":     ("backends.supabase",           "lookup_open_loop"),
     "recent_decisions":     ("backends.supabase",           "recent_decisions"),
     "mission_control_card": ("backends.supabase",           "mission_control_card"),
@@ -1006,7 +1013,7 @@ _TOOL_DISPATCH = {
 # Per-tool cache TTLs (seconds). Calendar and Gmail need shorter windows so
 # "what's on for the next hour" reflects late additions; static-ish queries
 # (notes, recent_decisions) can ride a longer tail.
-_TOOL_TTL = {
+_ALL_TOOL_TTL = {
     "calendar": 120.0,
     "gmail_search": 90.0,
     "lookup_open_loop": 180.0,
@@ -1015,6 +1022,51 @@ _TOOL_TTL = {
     "search_notes": 300.0,
     "recall_recent_call": 300.0,
 }
+
+
+def _build_toolkit() -> tuple[list, dict, dict]:
+    """Filter the full toolkit down to tools whose backends are actually
+    configured for this process. Called once at module load.
+
+    A clean public clone with only `OPENAI_API_KEY` ends up with three tools
+    registered: `search_notes`, `recall_recent_call`, `deep_research`. The
+    Realtime model never advertises a `calendar` or `gmail_search` it can't
+    actually call — avoiding the "tool returns null, model narrates
+    confusion" failure mode.
+
+    Reuses each backend's own availability check (no parallel env logic that
+    could drift):
+      - Supabase tools gate on `backends.supabase._creds()` returning both
+        a URL and a key (env or SECRETS_DIR fallback — single source of
+        truth).
+      - GWS tools gate on `backends.gws.ALLOWED_ACCOUNTS` being non-empty
+        AND the `gws-as.sh` wrapper existing on disk.
+      - `search_notes`, `recall_recent_call`, `deep_research` always
+        register (filesystem ripgrep, local-file recall, agent backend or
+        stub) — these have no external dependency to gate on.
+    """
+    available = {"search_notes", "recall_recent_call", "deep_research"}
+    try:
+        from backends.supabase import _creds as _supabase_creds
+        url, key = _supabase_creds()
+        if url and key:
+            available.update({"lookup_open_loop", "recent_decisions", "mission_control_card"})
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from backends.gws import ALLOWED_ACCOUNTS as _gws_accounts, GWS_WRAPPER as _gws_wrapper
+        if _gws_accounts and _gws_wrapper.exists():
+            available.update({"calendar", "gmail_search"})
+    except Exception:  # noqa: BLE001
+        pass
+    schemas = [s for s in _ALL_TOOLKIT_SCHEMAS if s["name"] in available]
+    dispatch = {k: v for k, v in _ALL_TOOL_DISPATCH.items() if k in available}
+    ttl = {k: v for k, v in _ALL_TOOL_TTL.items() if k in available}
+    return schemas, dispatch, ttl
+
+
+TOOLKIT_SCHEMAS, _TOOL_DISPATCH, _TOOL_TTL = _build_toolkit()
+log.info("toolkit registered: %s", sorted(s["name"] for s in TOOLKIT_SCHEMAS))
 
 
 async def tool_dispatch(request: web.Request) -> web.Response:
