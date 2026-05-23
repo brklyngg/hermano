@@ -5,9 +5,9 @@
 # Claude Code Handoff: Reduce Deep-Context Call Frequency with an Optimized Running Log
 
 **Created:** 2026-05-05 09:40 EDT  
-**Repo:** `/Users/jeromebot/VibeCoding/talk-to-your-context`  
+**Repo:** `/Users/jeromebot/VibeCoding/hermano`  
 **Audience:** Claude Code CLI working in the repo  
-**Goal:** diagnose and improve the architecture so Talk to Your Context keeps the “deep context” magic while avoiding unnecessary `ask_agent` calls on every substantive voice turn.
+**Goal:** diagnose and improve the architecture so Hermano keeps the “deep context” magic while avoiding unnecessary `ask_agent` calls on every substantive voice turn.
 
 ---
 
@@ -27,7 +27,7 @@ If proceeding to implementation, prefer a small, reversible change set with inst
 
 ## 1. Product thesis: what this is supposed to feel like
 
-The product is **Talk to Your Context**: a live, interruptible voice/text interface into the user’s actual working context.
+The product is **Hermano**: a live, interruptible voice/text interface into the user’s actual working context.
 
 The personal version is **Hermes Mini**. The open-source version is this repo.
 
@@ -443,7 +443,7 @@ A good solution should satisfy these constraints:
 
 The product philosophy from the blog draft is important:
 
-> “Talk to Your Context is small on purpose. Most of the complexity I cared about lives in the context layer — the LLM-wiki, the skills, the persistent memory — not in the agent topology.”
+> “Hermano is small on purpose. Most of the complexity I cared about lives in the context layer — the LLM-wiki, the skills, the persistent memory — not in the agent topology.”
 
 ---
 
@@ -602,4 +602,4 @@ Please inspect the current repo before deciding implementation. The suspected ro
 
 > the system has a fast shallow brain and a slow deep brain, but no optimized session-level working memory in between.
 
-Your job is to design and implement the smallest robust middle layer that lets Talk to Your Context keep deep context as its differentiator while reducing unnecessary deep-agent roundtrips.
+Your job is to design and implement the smallest robust middle layer that lets Hermano keep deep context as its differentiator while reducing unnecessary deep-agent roundtrips.

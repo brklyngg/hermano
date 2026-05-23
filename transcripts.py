@@ -59,6 +59,7 @@ def write_transcript(
     entries: List[Dict[str, Any]],
     *,
     metrics: Dict[str, Any] | None = None,
+    packet_ref: str | None = None,
 ) -> Path:
     TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
     path = TRANSCRIPT_DIR / f"{conv_id}.json"
@@ -70,6 +71,8 @@ def write_transcript(
     }
     if metrics:
         payload["metrics"] = metrics
+    if packet_ref:
+        payload["packet_ref"] = packet_ref
     path.write_text(json.dumps(payload, indent=2))
     log.info("wrote transcript %s (%d entries)", path, len(entries))
     return path

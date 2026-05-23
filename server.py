@@ -1,4 +1,4 @@
-"""Talk to Your Context — local voice sidecar.
+"""Hermano — local voice sidecar.
 
 Browser <-> OpenAI Realtime (WebRTC, direct) <-> your agent (via this proxy).
 
@@ -655,6 +655,93 @@ def _instructions_audit(suffixes: list[str | None] | None) -> tuple[int, str]:
     return len(s), hashlib.sha1(s.encode("utf-8")).hexdigest()[:12]
 
 
+def _build_instructions(suffixes: list[str | None] | None) -> str:
+    """Mirror of the assembly in `_mint_realtime_session`. Kept in one place so
+    the persisted packet matches the mint payload exactly."""
+    parts = [VOICE_SYSTEM_PROMPT]
+    for s in (suffixes or []):
+        if s and s.strip():
+            parts.append(s.strip())
+    return "\n\n".join(parts)
+
+
+_DEDUPE_RE = __import__("re").compile(r"^[\s>\-\*\+\d\.\)]+")
+
+
+def _dedupe_context_layers(
+    suffixes: list[str | None],
+) -> tuple[list[str | None], int]:
+    """Drop normalized-duplicate lines that appear in later suffixes when an
+    earlier suffix already contains them. Conservative: line-level match after
+    lowercasing, collapsing whitespace, and stripping leading bullet/markdown
+    markers. Order encodes precedence — earlier suffixes win.
+
+    Expected v1 impact is near-zero (different layers have different markdown
+    shapes). The dropped-count metric is the signal for whether to escalate to
+    semantic dedupe later.
+    """
+    def norm(line: str) -> str:
+        s = _DEDUPE_RE.sub("", line).strip().lower()
+        return " ".join(s.split())
+
+    seen: set[str] = set()
+    out: list[str | None] = []
+    dropped = 0
+    for s in suffixes:
+        if not s:
+            out.append(s)
+            continue
+        kept_lines: list[str] = []
+        for raw in s.split("\n"):
+            n = norm(raw)
+            if not n or len(n) < 8:  # don't dedupe headers, short markers
+                kept_lines.append(raw)
+                continue
+            if n in seen:
+                dropped += 1
+                continue
+            seen.add(n)
+            kept_lines.append(raw)
+        out.append("\n".join(kept_lines))
+    return out, dropped
+
+
+def _persist_mint_packet(
+    conv_id: str,
+    instructions: str,
+    meta: Dict[str, Any],
+) -> str | None:
+    """Persist the exact mint-instructions payload as a secondary artifact next
+    to the transcript. Returns the relative path of the .md file (for the
+    `packet_ref` field), or None on failure. Never raises — packet writes are
+    observability, not load-bearing for the mint response.
+    """
+    try:
+        from transcripts import TRANSCRIPT_DIR
+        pkt_dir = TRANSCRIPT_DIR / "packets"
+        pkt_dir.mkdir(parents=True, exist_ok=True)
+        from datetime import datetime
+        iso_ts = datetime.fromtimestamp(meta.get("minted_at", time.time())).astimezone().isoformat(timespec="seconds")
+        header = (
+            f"> Secondary handoff artifact — snapshot of context supplied to "
+            f"session {conv_id} at {iso_ts}. Not source-of-truth; revalidate "
+            f"before reuse.\n\n"
+        )
+        md_path = pkt_dir / f"{conv_id}.instructions.md"
+        json_path = pkt_dir / f"{conv_id}.packet.json"
+        full_meta = {**meta, "conv_id": conv_id, "secondary_artifact": True}
+        # tempfile + os.replace for atomic writes (matches voice_memory.py pattern)
+        for path, payload in ((md_path, header + instructions),
+                              (json_path, json.dumps(full_meta, indent=2))):
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(payload)
+            os.replace(tmp, path)
+        return f"packets/{conv_id}.instructions.md"
+    except Exception as e:  # noqa: BLE001
+        log.warning("mint packet persist failed for %s: %s", conv_id, e)
+        return None
+
+
 async def _mint_realtime_session(
     instructions_suffixes: list[str | None] | None = None,
 ) -> dict:
@@ -770,11 +857,16 @@ async def session_mint(request: web.Request) -> web.Response:
     transcript_index_block = voice_memory.render_transcript_index_markdown()
     honcho_block = honcho_voice.render_mint_context_block(conv_id)
     suffixes = [dossier_md, triage_suffix, honcho_block, *memory_blocks, transcript_index_block]
+    # Conservative cross-layer dedupe (line-level, normalized). Earlier suffixes
+    # win; later layers drop verbatim restatements. Expected v1 impact is
+    # near-zero — dropped_count is the measurement signal.
+    suffixes, dedupe_dropped_lines = _dedupe_context_layers(suffixes)
     # Guard the Realtime 16,384-token instructions cap. If the Honcho block
     # would push us over ~14k tokens, drop it rather than fail the mint.
     if sum(len(s or "") for s in suffixes) // 4 > 14000 and honcho_block:
         log.warning("dropping honcho_block to stay under instructions cap (conv=%s)", conv_id)
         suffixes = [dossier_md, triage_suffix, *memory_blocks, transcript_index_block]
+        suffixes, _ = _dedupe_context_layers(suffixes)
         honcho_block = ""
     try:
         data = await _mint_realtime_session(instructions_suffixes=suffixes)
@@ -786,13 +878,49 @@ async def session_mint(request: web.Request) -> web.Response:
         return web.json_response({"error": "ephemeral_mint_exception", "detail": str(e)}, status=502)
     instructions_chars, instructions_hash = _instructions_audit(suffixes)
     instructions_tokens_est = instructions_chars // 4
-    memory_sources_loaded = [b["header"] for b in voice_memory.load_memory_sources()]
+    memory_sources = voice_memory.load_memory_sources()
+    memory_sources_loaded = [b["header"] for b in memory_sources]
     memory_total_chars = sum(len(b) for b in memory_blocks)
     if instructions_tokens_est > 12000:
         log.warning(
             "session_minted: instructions ~%d tokens — approaching 16,384 cap (conv=%s)",
             instructions_tokens_est, conv_id,
         )
+    # Per-source breakdown for telemetry + packet metadata. Only sources that
+    # actually contributed chars get an entry. `stale`/`generated_at` are
+    # populated where the source exposes them (today: dossier only).
+    sources_meta: list[Dict[str, Any]] = []
+    if dossier_md:
+        sources_meta.append({
+            "name": "dossier",
+            "chars": dossier_meta["chars"],
+            "stale": bool(dossier_meta.get("stale", False)),
+            "age_h": dossier_meta.get("age_h"),
+        })
+    if triage_suffix:
+        sources_meta.append({"name": "triage_brief", "chars": len(triage_suffix)})
+    if honcho_block:
+        sources_meta.append({"name": "honcho", "chars": len(honcho_block)})
+    for header, block in zip(memory_sources_loaded, memory_blocks):
+        if block:
+            sources_meta.append({"name": f"memory:{header}", "chars": len(block)})
+    if transcript_index_block:
+        sources_meta.append({"name": "transcript_index", "chars": len(transcript_index_block)})
+    # Persist exact mint-instructions packet as a secondary artifact next to
+    # the transcript. Observability only — failures do not block the response.
+    minted_at = time.time()
+    instructions_full = _build_instructions(suffixes)
+    packet_ref = _persist_mint_packet(conv_id, instructions_full, {
+        "minted_at": minted_at,
+        "model": OPENAI_REALTIME_MODEL,
+        "voice": OPENAI_REALTIME_VOICE,
+        "mode": mode or "default",
+        "sources": sources_meta,
+        "dedupe_dropped_lines": dedupe_dropped_lines,
+        "instructions_chars": instructions_chars,
+        "instructions_hash": instructions_hash,
+    })
+    CONVERSATIONS[conv_id]["packet_ref"] = packet_ref
     log_call_event(
         LOG_DIR, conv_id, "session_minted",
         model=OPENAI_REALTIME_MODEL, voice=OPENAI_REALTIME_VOICE,
@@ -809,6 +937,9 @@ async def session_mint(request: web.Request) -> web.Response:
         instructions_chars=instructions_chars,
         instructions_tokens_est=instructions_tokens_est,
         instructions_hash=instructions_hash,
+        sources=sources_meta,
+        dedupe_dropped_lines=dedupe_dropped_lines,
+        packet_ref=packet_ref,
     )
     return web.json_response({"conv_id": conv_id, "session": data, "mode": mode or "default"})
 
@@ -1229,7 +1360,7 @@ async def end_call(request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "noop": "already_ended"})
     all_entries = sorted(conv["entries"] + client_entries, key=lambda e: e.get("ts", 0))
     metrics = compute_routing_metrics(LOG_DIR, conv_id)
-    path = write_transcript(conv_id, conv["started_at"], all_entries, metrics=metrics)
+    path = write_transcript(conv_id, conv["started_at"], all_entries, metrics=metrics, packet_ref=conv.get("packet_ref"))
     ended_at = time.time()
     asyncio.create_task(ingest_into_agent(
         conv_id, all_entries,
@@ -1303,7 +1434,7 @@ async def _reap_stale_conversations() -> None:
             all_entries = sorted(conv.get("entries", []), key=lambda e: e.get("ts", 0))
             metrics = compute_routing_metrics(LOG_DIR, cid)
             try:
-                write_transcript(cid, conv["started_at"], all_entries, metrics=metrics)
+                write_transcript(cid, conv["started_at"], all_entries, metrics=metrics, packet_ref=conv.get("packet_ref"))
             except Exception:  # noqa: BLE001
                 log.exception("reap: write_transcript failed for %s", cid)
             slack_posted = False
@@ -1445,7 +1576,7 @@ def make_app() -> web.Application:
 
 
 def main() -> None:
-    log.info("talk-to-your-context starting on %s:%s - model=%s voice=%s", HOST, PORT, OPENAI_REALTIME_MODEL, OPENAI_REALTIME_VOICE)
+    log.info("hermano starting on %s:%s - model=%s voice=%s", HOST, PORT, OPENAI_REALTIME_MODEL, OPENAI_REALTIME_VOICE)
     web.run_app(make_app(), host=HOST, port=PORT, access_log=None)
 
 

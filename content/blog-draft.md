@@ -36,7 +36,7 @@ So I built the smaller half of the gap myself.
 
 ## The thing I built
 
-The personal version is called Hermes Mini. The open-source version I'm releasing today is **Talk to Your Context**.
+The personal version is called Hermes Mini. The open-source version I'm releasing today is **Hermano**.
 
 Architecturally it's a small stack, and the shape changed once I'd lived with it for a few weeks. The first cut funneled every substantive turn through a single slow `ask_agent` call. It worked, but it was wrong: most questions don't *need* the full agent loop, they need one specific piece of context delivered fast. So I split it.
 
@@ -97,13 +97,13 @@ What's still imperfect, said honestly:
 
 While I'm here: it has never been more tempting to build a crazy complex agent harness — multi-agent orchestration, sub-agents that hire sub-agents, a 47-step ReAct loop with tool-routing on every turn. **It's a trap.**
 
-The right model is leaner. Hire agents the way you'd add new roles to a lean team. One agent with a good context layer and the right three skills will out-perform a baroque multi-agent harness on almost any real task — and you can actually debug it when it goes sideways. Talk to Your Context is small on purpose. Most of the complexity I cared about lives in the *context* layer (the LLM-wiki, the skills, the persistent memory) — not in the agent topology.
+The right model is leaner. Hire agents the way you'd add new roles to a lean team. One agent with a good context layer and the right three skills will out-perform a baroque multi-agent harness on almost any real task — and you can actually debug it when it goes sideways. Hermano is small on purpose. Most of the complexity I cared about lives in the *context* layer (the LLM-wiki, the skills, the persistent memory) — not in the agent topology.
 
 That distinction is the one I'd want a reader to take away. Context is leverage. Harnesses are mostly LARP-ing.
 
 ## Here's the repo
 
-[`github.com/brklyngg/talk-to-your-context`](https://github.com/brklyngg/talk-to-your-context) — MIT, give-it-away.
+[`github.com/brklyngg/hermano`](https://github.com/brklyngg/hermano) — MIT, give-it-away.
 
 There's a bundled in-process stub backend so you can run the full stack in 60 seconds with just an OpenAI API key. When you're ready for real answers, point `AGENT_API_BASE` at any OpenAI-compatible chat-completions SSE endpoint — your own agent, `ollama serve`, vLLM, whatever. The narrow toolkit ships with adapter stubs you replace with your own data sources. There are README stubs for swapping the Slack transcript archive to Telegram, Discord, Matrix, or email. If you build an adapter, send a PR.
 

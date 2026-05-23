@@ -1,4 +1,4 @@
-// Talk to Your Context - browser app. WebRTC <-> OpenAI Realtime, with ask_agent tool.
+// Hermano - browser app. WebRTC <-> OpenAI Realtime, with ask_agent tool.
 // Free of frameworks; vanilla DOM + fetch + RTCPeerConnection.
 
 const $ = (id) => document.getElementById(id);

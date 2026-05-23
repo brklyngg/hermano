@@ -1,4 +1,4 @@
-# Talk to Your Context
+# Hermano
 
 A live voice and text interface for your own context agent. Browser PWA + Python sidecar. You bring the agent — Hermes is the documented default, but anything with an OpenAI-compatible chat-completions endpoint works. The point isn't another chat UI; the point is brainstorming-grade conversation with a system that already knows your notes, skills, memory, and tools.
 

@@ -1,4 +1,4 @@
-# Talk to Your Context
+# Hermano
 
 A live, interruptible voice line to your own agent. Browser ↔ OpenAI Realtime (`gpt-realtime-2`) ↔ a tiny local sidecar ↔ direct backends for the fast stuff, plus a slow `deep_research` path for the rare hard questions.
 
@@ -24,8 +24,8 @@ The point: instead of starting every voice turn from zero ("hi, can you help me 
 ## Quickstart (60 seconds, no backend required)
 
 ```bash
-git clone https://github.com/brklyngg/talk-to-your-context
-cd talk-to-your-context
+git clone https://github.com/brklyngg/hermano
+cd hermano
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env

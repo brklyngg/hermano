@@ -144,7 +144,7 @@ return await asyncio.wait_for(
 `_iter_sse_with_idle_watchdog` was deleted in commit `1649602`. To restore the idle-gap pattern (if Q4 says Case A): `git show 1649602^:server.py | sed -n '/_iter_sse_with_idle_watchdog/,/^$/p'`.
 
 Live `.env`s on this machine:
-- `~/VibeCoding/talk-to-your-context/.env` — local dev placeholder.
+- `~/VibeCoding/hermano/.env` — local dev placeholder.
 - `~/.hermes-custom/hermes-mini/.env` — what the deployed sidecar reads. Has `ASK_AGENT_TIMEOUT_SEC=90`.
 
 `sync-to-deploy.sh:73` — `add_if_missing ASK_AGENT_TIMEOUT_SEC '90'`. Update default if/when the sidecar fix lands.
@@ -188,7 +188,7 @@ Whatever the upstream fix is (Hermes skill, model layer, sidecar architecture, o
 ## Deploy steps once you have a fix
 
 ```bash
-cd ~/VibeCoding/talk-to-your-context
+cd ~/VibeCoding/hermano
 # … make the upstream fix (Hermes-side, sidecar-side, or both) …
 python3 -m py_compile server.py transcripts.py auth.py events.py
 node --check web/app.js
