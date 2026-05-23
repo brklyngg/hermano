@@ -36,6 +36,11 @@ let ambientBuffer = null;  // decoded AudioBuffer cached when /static/ambient.mp
 const clientEntries = [];  // {role, text, ts, latencyMs?} for end-of-call upload
 let pendingAssistantBubble = null;
 const turnTiming = { userDoneTs: null, firstTokenTs: null };
+// Anchors the persisted user-entry ts to when speech actually stopped, not
+// when OpenAI's transcription pipeline completed (which can land *after* the
+// assistant reply for short turns and invert the on-disk order). Cleared
+// after each user entry and on reconnect.
+let lastSpeechStoppedTs = null;
 
 // Connection-state debounce (5G <-> wifi handover, transient blips)
 let connDownSinceTs = null;
@@ -245,7 +250,8 @@ function updateBubbleMeta(div, patch) {
 
 function recordEntry(role, text, extra) {
   if (!text) return;
-  const entry = { role, text, ts: Date.now() / 1000 };
+  const ts = (extra && typeof extra.ts === "number") ? extra.ts : Date.now() / 1000;
+  const entry = { role, text, ts };
   if (extra && typeof extra.latencyMs === "number" && extra.latencyMs > 0) {
     entry.latencyMs = extra.latencyMs;
   }
@@ -343,6 +349,8 @@ async function attachPeer(session, resumeContext) {
   const model = session.session.model || "gpt-realtime";
   // Reset for the brown-noise bridge: flips true when first audio frame arrives.
   firstAudioFrameSeen = false;
+  // Don't carry a stale speech-stop anchor across a cap-swap / forced reconnect.
+  lastSpeechStoppedTs = null;
 
   const newPc = new RTCPeerConnection();
   newPc.onconnectionstatechange = () => onConnectionStateChange(newPc);
@@ -808,6 +816,14 @@ function onDcMessage(ev) {
       break;
     }
 
+    case "input_audio_buffer.speech_stopped":
+      // Server-VAD signal that the user finished talking. Fires BEFORE
+      // transcription completes, so it's the right anchor for the persisted
+      // user-entry ts. Not all VAD modes emit this reliably — recordEntry
+      // falls back to Date.now() when null.
+      lastSpeechStoppedTs = Date.now() / 1000;
+      break;
+
     case "conversation.item.input_audio_transcription.delta":
       userTranscriptBuf += msg.delta || "";
       break;
@@ -820,7 +836,14 @@ function onDcMessage(ev) {
         turnTiming.userDoneTs = userDoneTs;
         turnTiming.firstTokenTs = null;
         appendBubble("user", text, { createdAt: userDoneTs });
-        recordEntry("user", text);
+        // Anchor persisted ts to speech_stopped; clamp below any assistant
+        // bubble that already started this turn so sort can't invert them.
+        const candidate = lastSpeechStoppedTs ?? Date.now() / 1000;
+        const pendingMs = pendingAssistantBubble?._meta?.createdAt;
+        const ceiling = (typeof pendingMs === "number") ? (pendingMs / 1000 - 0.001) : null;
+        const tsOverride = ceiling != null ? Math.min(candidate, ceiling) : candidate;
+        lastSpeechStoppedTs = null;
+        recordEntry("user", text, { ts: tsOverride });
         // Phase 0 routing telemetry: 1 event per user turn. Server derives
         // local_answer_turns = user_turns - ask_agent_count. See
         // events.py:compute_routing_metrics.
