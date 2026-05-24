@@ -47,3 +47,6 @@ Thumbs.db
 
 # Test/dev tooling artifacts
 .playwright-mcp/
+
+# Internal harness session log (workflow patterns, not for public)
+EVOLVE.md
