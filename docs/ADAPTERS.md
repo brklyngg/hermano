@@ -1,7 +1,5 @@
 # Adapters
 
-> TODO: fill in.
-
 The sidecar has one optional outbound integration today: post a finished call's transcript to a messaging channel. The shape is intentionally narrow so other backends can drop in.
 
 ## Adapter interface (concept)

@@ -125,10 +125,9 @@ node --check web/app.js
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how the pieces talk, full lifecycle, tradeoffs.
 - [`docs/ADAPTERS.md`](docs/ADAPTERS.md) — plugging in messaging backends (Slack today; pattern generalizes).
-- [`docs/PRODUCT_ANALYSIS.md`](docs/PRODUCT_ANALYSIS.md) — requirements, compromises, decision criteria.
 - [`backends/`](backends/) — direct-backend adapters + the stub agent.
 - [`server.py`](server.py) · [`dossier.py`](dossier.py) · [`voice_memory.py`](voice_memory.py) · [`web/app.js`](web/app.js) — the four files that matter.
 
 ## License
 
-TBD. Treat as "look, don't redistribute" until that lands.
+MIT — see [LICENSE](LICENSE).
