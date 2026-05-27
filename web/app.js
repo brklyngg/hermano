@@ -282,18 +282,20 @@ function createBrownNoiseIcebreaker(ctx) {
   const lp = ctx.createBiquadFilter();
   lp.type = "lowpass"; lp.frequency.value = 200; lp.Q.value = 0.7;
   const master = ctx.createGain(); master.gain.value = 0;
-  const lfo = ctx.createOscillator(); lfo.frequency.value = 0.3;
-  const lfoGain = ctx.createGain(); lfoGain.gain.value = 0.05;
   src.connect(lp).connect(master).connect(ctx.destination);
-  lfo.connect(lfoGain).connect(master.gain);
-  src.start(); lfo.start();
+  src.start();
+  // Keep the procedural fallback steady: avoid any amplitude pulse that can read
+  // as breathing/heartbeat while the app is bridging a silent reconnect gap.
+  // setTargetAtTime matches createSampleIcebreaker's idiom and self-supersedes,
+  // so overlapping fades re-aim from the live value without colliding (no manual
+  // cancel/anchor, and no implementation-dependent .value read mid-ramp).
   const fade = (target, dur = 0.25) =>
-    master.gain.linearRampToValueAtTime(target, ctx.currentTime + dur);
+    master.gain.setTargetAtTime(target, ctx.currentTime, dur / 3);
   return {
-    fadeIn: () => fade(0.35),
+    fadeIn: () => fade(0.24),
     fadeOut: () => fade(0.0),
     dispose: () => {
-      try { src.stop(); lfo.stop(); src.disconnect(); lp.disconnect(); master.disconnect(); lfoGain.disconnect(); } catch {}
+      try { src.stop(); src.disconnect(); lp.disconnect(); master.disconnect(); } catch {}
     },
   };
 }
