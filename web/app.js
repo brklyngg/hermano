@@ -282,18 +282,17 @@ function createBrownNoiseIcebreaker(ctx) {
   const lp = ctx.createBiquadFilter();
   lp.type = "lowpass"; lp.frequency.value = 200; lp.Q.value = 0.7;
   const master = ctx.createGain(); master.gain.value = 0;
-  const lfo = ctx.createOscillator(); lfo.frequency.value = 0.3;
-  const lfoGain = ctx.createGain(); lfoGain.gain.value = 0.05;
   src.connect(lp).connect(master).connect(ctx.destination);
-  lfo.connect(lfoGain).connect(master.gain);
-  src.start(); lfo.start();
-  const fade = (target, dur = 0.25) =>
+  src.start();
+  const fade = (target, dur = 0.25) => {
+    master.gain.cancelScheduledValues(ctx.currentTime);
     master.gain.linearRampToValueAtTime(target, ctx.currentTime + dur);
+  };
   return {
-    fadeIn: () => fade(0.35),
+    fadeIn: () => fade(0.28),
     fadeOut: () => fade(0.0),
     dispose: () => {
-      try { src.stop(); lfo.stop(); src.disconnect(); lp.disconnect(); master.disconnect(); lfoGain.disconnect(); } catch {}
+      try { src.stop(); src.disconnect(); lp.disconnect(); master.disconnect(); } catch {}
     },
   };
 }
