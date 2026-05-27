@@ -903,13 +903,27 @@ function onDcMessage(ev) {
       break;
     }
 
-    case "response.done":
+    case "response.done": {
       responseInFlight = false;
+      // Forward the Realtime usage block so the server can derive per-call cost
+      // and cache-hit ratio (the single biggest cost lever). Fields per OpenAI
+      // docs; absent on older models — log null and move on.
+      const u = msg.response?.usage || null;
       logClientEvent("client_response_done", {
         response_id: msg.response?.id || null,
         output_item_count: Array.isArray(msg.response?.output) ? msg.response.output.length : null,
+        usage: u && {
+          input_tokens: u.input_tokens ?? null,
+          output_tokens: u.output_tokens ?? null,
+          cached_tokens: u.input_token_details?.cached_tokens ?? null,
+          input_audio_tokens: u.input_token_details?.audio_tokens ?? null,
+          input_text_tokens: u.input_token_details?.text_tokens ?? null,
+          output_audio_tokens: u.output_token_details?.audio_tokens ?? null,
+          output_text_tokens: u.output_token_details?.text_tokens ?? null,
+        },
       });
       break;
+    }
 
     case "error": {
       const code = msg.error?.code;
