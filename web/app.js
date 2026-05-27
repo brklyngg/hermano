@@ -286,11 +286,11 @@ function createBrownNoiseIcebreaker(ctx) {
   src.start();
   // Keep the procedural fallback steady: avoid any amplitude pulse that can read
   // as breathing/heartbeat while the app is bridging a silent reconnect gap.
-  const fade = (target, dur = 0.25) => {
-    master.gain.cancelScheduledValues(ctx.currentTime);
-    master.gain.setValueAtTime(master.gain.value, ctx.currentTime);
-    master.gain.linearRampToValueAtTime(target, ctx.currentTime + dur);
-  };
+  // setTargetAtTime matches createSampleIcebreaker's idiom and self-supersedes,
+  // so overlapping fades re-aim from the live value without colliding (no manual
+  // cancel/anchor, and no implementation-dependent .value read mid-ramp).
+  const fade = (target, dur = 0.25) =>
+    master.gain.setTargetAtTime(target, ctx.currentTime, dur / 3);
   return {
     fadeIn: () => fade(0.24),
     fadeOut: () => fade(0.0),
