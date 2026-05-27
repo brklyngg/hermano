@@ -284,12 +284,15 @@ function createBrownNoiseIcebreaker(ctx) {
   const master = ctx.createGain(); master.gain.value = 0;
   src.connect(lp).connect(master).connect(ctx.destination);
   src.start();
+  // Keep the procedural fallback steady: avoid any amplitude pulse that can read
+  // as breathing/heartbeat while the app is bridging a silent reconnect gap.
   const fade = (target, dur = 0.25) => {
     master.gain.cancelScheduledValues(ctx.currentTime);
+    master.gain.setValueAtTime(master.gain.value, ctx.currentTime);
     master.gain.linearRampToValueAtTime(target, ctx.currentTime + dur);
   };
   return {
-    fadeIn: () => fade(0.28),
+    fadeIn: () => fade(0.24),
     fadeOut: () => fade(0.0),
     dispose: () => {
       try { src.stop(); src.disconnect(); lp.disconnect(); master.disconnect(); } catch {}
