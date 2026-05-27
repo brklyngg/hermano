@@ -55,6 +55,18 @@ log = logging.getLogger("ttyc.server")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2")
 OPENAI_REALTIME_VOICE = os.getenv("OPENAI_REALTIME_VOICE", "alloy")
+# Realtime context-truncation cost lever. With semantic_vad, idle/wait silence is
+# free; the real spend driver is per-turn context re-billing (the whole
+# conversation is re-sent each turn). `post_instructions` caps conversation tokens
+# *after* the instruction block, bounding per-turn input regardless of call length;
+# `retention_ratio` < 1.0 drops extra on truncation so the next (cache-busting)
+# truncation lands later. Docs: https://developers.openai.com/api/docs/guides/realtime-costs
+REALTIME_TRUNCATION_RETENTION_RATIO = float(
+    os.getenv("REALTIME_TRUNCATION_RETENTION_RATIO", "0.8")
+)
+REALTIME_POST_INSTRUCTIONS_TOKENS = int(
+    os.getenv("REALTIME_POST_INSTRUCTIONS_TOKENS", "10000")
+)
 # Operator's first name — used in prompts and tool-schema descriptions so the
 # model addresses them naturally instead of saying "the user". Default keeps
 # the public scaffold clean; personal deployments set this in .env.
@@ -104,7 +116,10 @@ CONVERSATIONS: Dict[str, Dict[str, Any]] = {}
 # Idle-reap window. Backgrounding no longer ends a call, so we use this as
 # the cost guard instead of the prior 65-min started_at ceiling.
 REAPER_INTERVAL_SEC = 60
-REAPER_IDLE_TIMEOUT_SEC = 20 * 60
+# Lowered default (was 20min): with semantic_vad an idle open session bills ~0 for
+# silence, but ending sooner caps spurious-VAD re-bills if the user walks away
+# mid-conversation. Env-configurable for tuning against cost telemetry.
+REAPER_IDLE_TIMEOUT_SEC = int(os.getenv("REAPER_IDLE_TIMEOUT_SEC", str(10 * 60)))
 
 
 def _touch(conv: Dict[str, Any]) -> None:
@@ -784,6 +799,14 @@ async def _mint_realtime_session(
             "tool_choice": "auto",
             "output_modalities": ["audio"],
             "max_output_tokens": 1500,
+            # Bound per-turn context growth (cost lever — see constants above).
+            "truncation": {
+                "type": "retention_ratio",
+                "retention_ratio": REALTIME_TRUNCATION_RETENTION_RATIO,
+                "token_limits": {
+                    "post_instructions": REALTIME_POST_INSTRUCTIONS_TOKENS
+                },
+            },
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcm", "rate": 24000},

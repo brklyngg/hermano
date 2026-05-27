@@ -18,6 +18,57 @@ from typing import Any, Iterator
 
 log = logging.getLogger("ttyc.events")
 
+# Approximate Realtime list prices, USD per 1M tokens. These drift — they exist to
+# turn the per-response `usage` block into a directional per-call cost estimate and,
+# more importantly, a cache-hit ratio (the single biggest cost lever). Cached input
+# is ~80x cheaper than uncached, which is why we track it explicitly. Unknown models
+# fall back to the gpt-realtime-2 row. Mini rates are approximate — confirm against
+# https://openai.com/api/pricing/ before treating the dollar figure as authoritative.
+REALTIME_RATES_USD_PER_MTOK: dict[str, dict[str, float]] = {
+    "gpt-realtime-2": {
+        "text_input": 4.0, "text_output": 16.0,
+        "audio_input": 32.0, "audio_output": 64.0, "cached_input": 0.40,
+    },
+    "gpt-realtime-mini": {
+        "text_input": 0.60, "text_output": 2.40,
+        "audio_input": 10.0, "audio_output": 20.0, "cached_input": 0.30,
+    },
+}
+_DEFAULT_RATE_MODEL = "gpt-realtime-2"
+
+
+def _estimate_realtime_cost(model: str | None, u: dict[str, int]) -> float | None:
+    """Directional USD estimate for one call's summed Realtime `usage` tokens.
+
+    Cached input billed at the cached rate; the remaining (uncached) input is split
+    into audio/text by the reported token mix; output is never cached. Returns None
+    when no usage was captured (older models don't emit it).
+    """
+    if not u or not u.get("input_tokens") and not u.get("output_tokens"):
+        return None
+    rates = REALTIME_RATES_USD_PER_MTOK.get(
+        model or "", REALTIME_RATES_USD_PER_MTOK[_DEFAULT_RATE_MODEL]
+    )
+    cached = u.get("cached_tokens") or 0
+    uncached_in = max(0, (u.get("input_tokens") or 0) - cached)
+    in_audio = u.get("input_audio_tokens") or 0
+    in_text = u.get("input_text_tokens") or 0
+    in_known = in_audio + in_text
+    # Apportion uncached input across audio/text by the reported mix (default audio).
+    audio_share = (in_audio / in_known) if in_known else 1.0
+    uncached_audio = uncached_in * audio_share
+    uncached_text = uncached_in * (1.0 - audio_share)
+    out_audio = u.get("output_audio_tokens") or 0
+    out_text = u.get("output_text_tokens") or 0
+    cost = (
+        cached * rates["cached_input"]
+        + uncached_audio * rates["audio_input"]
+        + uncached_text * rates["text_input"]
+        + out_audio * rates["audio_output"]
+        + out_text * rates["text_output"]
+    ) / 1_000_000
+    return round(cost, 4)
+
 
 def calls_dir(base_log_dir: Path) -> Path:
     d = base_log_dir / "calls"
@@ -96,6 +147,14 @@ def compute_routing_metrics(base_log_dir: Path, conv_id: str) -> dict:
     intent_counts: dict[str, int] = {}
     freshness_required_count = 0
     ask_latencies_ms: list[int] = []
+    # Cost telemetry — summed across response.done usage blocks.
+    cost_model: str | None = None
+    usage_responses = 0
+    usage_tot = {
+        "input_tokens": 0, "output_tokens": 0, "cached_tokens": 0,
+        "input_audio_tokens": 0, "input_text_tokens": 0,
+        "output_audio_tokens": 0, "output_text_tokens": 0,
+    }
 
     def _finalize_user_turn():
         nonlocal followup_total, followup_in_context, last_user_was_after_tool
@@ -160,6 +219,16 @@ def compute_routing_metrics(base_log_dir: Path, conv_id: str) -> dict:
             last_user_was_after_tool = True
         elif name == "tool_error":
             tool_err_count += 1
+        elif name == "session_minted":
+            cost_model = evt.get("model") or cost_model
+        elif name == "client_response_done":
+            u = evt.get("usage")
+            if isinstance(u, dict):
+                usage_responses += 1
+                for k in usage_tot:
+                    v = u.get(k)
+                    if isinstance(v, (int, float)):
+                        usage_tot[k] += int(v)
     # Finalize the trailing user turn (if any).
     if user_just_started:
         _finalize_user_turn()
@@ -184,6 +253,9 @@ def compute_routing_metrics(base_log_dir: Path, conv_id: str) -> dict:
         sorted(ask_latencies_ms)[int(len(ask_latencies_ms) * 0.95)]
         if len(ask_latencies_ms) >= 5 else None
     )
+    cost_estimate_usd = _estimate_realtime_cost(cost_model, usage_tot)
+    total_in = usage_tot["input_tokens"]
+    cache_hit_ratio = (usage_tot["cached_tokens"] / total_in) if total_in else None
     return {
         "voice_turns": voice_turns,
         "local_answer_turns": local_answer_turns,
@@ -207,6 +279,11 @@ def compute_routing_metrics(base_log_dir: Path, conv_id: str) -> dict:
         "freshness_required_count": freshness_required_count,
         "ask_latency_ms_avg": ask_latency_avg,
         "ask_latency_ms_p95": ask_latency_p95,
+        # Cost telemetry — cache_hit_ratio is the headline efficiency signal.
+        "cost_model": cost_model,
+        "cost_estimate_usd": cost_estimate_usd,
+        "cache_hit_ratio": round(cache_hit_ratio, 3) if cache_hit_ratio is not None else None,
+        "usage_tokens": dict(usage_tot) if usage_responses else None,
     }
 
 

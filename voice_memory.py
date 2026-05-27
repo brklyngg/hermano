@@ -41,8 +41,10 @@ _MEMORY_SOURCES: list[tuple[str, str, str]] = [
 ]
 
 # Per-source cap to bound prompt size. VOICE.md grows over time; older entries
-# stay on disk but only the recency window lands in the prompt.
-_MEMORY_BLOCK_CHAR_CAP = 5000
+# stay on disk but only the recency window lands in the prompt. Env-tunable: the
+# injected memory block is re-billed as input every turn, so this is a direct cost
+# knob — lower it to trade context depth for cheaper turns.
+_MEMORY_BLOCK_CHAR_CAP = int(os.getenv("VOICE_MEMORY_BLOCK_CHAR_CAP", "5000"))
 
 _TRANSCRIPT_INDEX_HEADER = "Recent voice calls"
 _TRANSCRIPT_INDEX_MAX_ENTRIES = 30
