@@ -725,10 +725,18 @@ async function triggerResume(reason, { silent = false } = {}) {
     // started=true, clientEntries, and the icebreaker bed intact across the gap).
     if (dc) { try { dc.close(); } catch {} dc = null; }
     if (pc) { try { pc.close(); } catch {} pc = null; }
+    // Send a bounded tail of the conversation so the server can rebuild a recap
+    // for the fresh session. This is the continuity fallback when the dying
+    // session's handoff note fails (silent freeze → empty note); clientEntries
+    // survive the resume (we don't cleanupCall), so they're a reliable source.
+    const recentEntries = clientEntries
+      .filter((e) => e.role === "user" || e.role === "assistant")
+      .slice(-12)
+      .map((e) => ({ role: e.role, text: String(e.text || "").slice(0, 400), ts: e.ts }));
     const r = await fetch("/api/resume", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ conv_id: convId }),
+      body: JSON.stringify({ conv_id: convId, recent_entries: recentEntries }),
     });
     const data = await r.json();
     if (data.expired) {
