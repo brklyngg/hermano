@@ -64,8 +64,11 @@ OPENAI_REALTIME_VOICE = os.getenv("OPENAI_REALTIME_VOICE", "alloy")
 REALTIME_TRUNCATION_RETENTION_RATIO = float(
     os.getenv("REALTIME_TRUNCATION_RETENTION_RATIO", "0.8")
 )
+# Generous default: an earlier 10000 proved too low for long, context-heavy calls
+# (the model lost recent turns). This caps only pathological runaway; set to 0 to
+# omit the cap entirely and let the model use its full context window.
 REALTIME_POST_INSTRUCTIONS_TOKENS = int(
-    os.getenv("REALTIME_POST_INSTRUCTIONS_TOKENS", "10000")
+    os.getenv("REALTIME_POST_INSTRUCTIONS_TOKENS", "24000")
 )
 # Operator's first name — used in prompts and tool-schema descriptions so the
 # model addresses them naturally instead of saying "the user". Default keeps
@@ -765,6 +768,18 @@ def _persist_mint_packet(
         return None
 
 
+def _truncation_cfg() -> dict:
+    """Realtime context-truncation config for the mint body. Omits the
+    post_instructions cap when set to 0 so the model uses its full window."""
+    cfg: dict = {
+        "type": "retention_ratio",
+        "retention_ratio": REALTIME_TRUNCATION_RETENTION_RATIO,
+    }
+    if REALTIME_POST_INSTRUCTIONS_TOKENS > 0:
+        cfg["token_limits"] = {"post_instructions": REALTIME_POST_INSTRUCTIONS_TOKENS}
+    return cfg
+
+
 async def _mint_realtime_session(
     instructions_suffixes: list[str | None] | None = None,
 ) -> dict:
@@ -800,13 +815,7 @@ async def _mint_realtime_session(
             "output_modalities": ["audio"],
             "max_output_tokens": 1500,
             # Bound per-turn context growth (cost lever — see constants above).
-            "truncation": {
-                "type": "retention_ratio",
-                "retention_ratio": REALTIME_TRUNCATION_RETENTION_RATIO,
-                "token_limits": {
-                    "post_instructions": REALTIME_POST_INSTRUCTIONS_TOKENS
-                },
-            },
+            "truncation": _truncation_cfg(),
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcm", "rate": 24000},
@@ -1308,14 +1317,52 @@ async def text_turn(request: web.Request) -> web.Response:
     return web.json_response({"answer": answer})
 
 
+def _build_resume_recap(conv: dict, client_recent: list) -> str | None:
+    """Compact recent-conversation recap for resume continuity.
+
+    Merges the server's tool turns (``conv['entries']`` — e.g. files saved,
+    research results) with the client's audio turns (sent in the resume body),
+    sorts by ts, and renders a bounded tail. This is the continuity FALLBACK for
+    when the dying session's handoff note fails (a silent freeze yields an empty
+    note): the recap is reconstructed from preserved state and does not depend on
+    the frozen session responding, so the resumed model still knows what was said
+    and done — including actions like "saved file X" that a blank note would lose.
+    """
+    label = {
+        "user": "You", "user_text": "You",
+        "assistant": "Assistant", "assistant_text": "Assistant",
+        "tool_answer": "Result",
+    }
+    merged = []
+    for e in list(conv.get("entries") or []) + list(client_recent or []):
+        who = label.get(e.get("role"))
+        text = (e.get("text") or "").strip()
+        if who and text:
+            merged.append((e.get("ts") or 0, who, text))
+    if not merged:
+        return None
+    merged.sort(key=lambda x: x[0])
+    lines = [f"- {who}: {text[:300]}" for _, who, text in merged[-12:]]
+    while sum(len(l) for l in lines) > 2000 and len(lines) > 3:
+        lines.pop(0)
+    return (
+        "Recent conversation so far in THIS SAME call (your own memory — you are "
+        "resuming after a brief connection drop; do not greet, re-introduce "
+        "yourself, or repeat any action already completed below):\n"
+        + "\n".join(lines)
+    )
+
+
 async def resume_call(request: web.Request) -> web.Response:
     """Mint a fresh Realtime ephemeral session bound to the same conv.
 
-    Continuity is delivered via the freshly-minted session's ``instructions``
-    (the handoff-note continuation suffix is baked in server-side). 128K
-    context + GPT-5-class reasoning means we don't need a recent-entries
-    replay primer; the dying session's handoff note is the sole continuity
-    signal.
+    Continuity is delivered via the freshly-minted session's ``instructions``.
+    Two complementary signals are baked in: the dying session's handoff note
+    (best-effort "where we left off mid-thought") AND a recent-conversation
+    recap reconstructed from preserved server + client state. The recap is the
+    fallback that keeps continuity intact when the handoff note fails — a silent
+    freeze yields a 0-char note, and without the recap the resumed session would
+    start blank and forget everything said/done earlier in the call.
     """
     body = await request.json()
     conv_id = body.get("conv_id")
@@ -1336,12 +1383,14 @@ async def resume_call(request: web.Request) -> web.Response:
             + "where you left off in topic and tone. Wait for the user's next "
             + "utterance before responding."
         )
-    # On resume we still want the dossier present — same standing context as
-    # the original mint; the handoff note layers on top for in-call continuity.
+    recap_suffix = _build_resume_recap(conv, body.get("recent_entries") or [])
+    # On resume we still want the dossier present — same standing context as the
+    # original mint; recap (factual record) + handoff note (continuation cue)
+    # layer on top for in-call continuity.
     dossier_md, _ = dossier.load_dossier()
     try:
         data = await _mint_realtime_session(
-            instructions_suffixes=[dossier_md, handoff_suffix],
+            instructions_suffixes=[dossier_md, recap_suffix, handoff_suffix],
         )
     except httpx.HTTPStatusError as e:
         log.error("resume mint failed: %s %s", e.response.status_code, e.response.text[:300])
@@ -1353,6 +1402,7 @@ async def resume_call(request: web.Request) -> web.Response:
     log_call_event(
         LOG_DIR, conv_id, "resumed",
         handoff_note_chars=len(note),
+        recap_chars=len(recap_suffix or ""),
     )
     return web.json_response({
         "conv_id": conv_id,
