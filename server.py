@@ -39,6 +39,12 @@ import voice_memory  # noqa: E402
 import honcho_voice  # noqa: E402
 from events import log_call_event, compute_routing_metrics  # noqa: E402
 from transcripts import write_transcript, ingest_into_agent, post_to_slack  # noqa: E402
+# Imported at module load (after load_dotenv) so the account roster is available
+# when the tool schemas below are built. backends.gws is stdlib-only — no cycle.
+from backends.gws import (  # noqa: E402
+    ALLOWED_ACCOUNTS as GWS_ALLOWED_ACCOUNTS,
+    DEFAULT_ACCOUNT as GWS_DEFAULT_ACCOUNT,
+)
 
 LOG_DIR = HERE / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -64,11 +70,16 @@ OPENAI_REALTIME_VOICE = os.getenv("OPENAI_REALTIME_VOICE", "alloy")
 REALTIME_TRUNCATION_RETENTION_RATIO = float(
     os.getenv("REALTIME_TRUNCATION_RETENTION_RATIO", "0.8")
 )
-# Generous default: an earlier 10000 proved too low for long, context-heavy calls
-# (the model lost recent turns). This caps only pathological runaway; set to 0 to
-# omit the cap entirely and let the model use its full context window.
+# Generous default. History: 10000 proved too low (model lost recent turns);
+# 24000 still truncated saved working state on long, context-heavy calls
+# (Gary flagged the continuity loss explicitly). Bumped to 48000 — continuity
+# wins over marginal cost here, since semantic_vad means idle silence isn't
+# billed and prompt caching absorbs most per-turn input cost. This caps only
+# pathological runaway; set to 0 to omit the cap and use the full window.
+# DO NOT hand-roll `conversation.item.delete` pruning as a cheaper alternative —
+# it busts the cached prefix and is net-negative (see CLAUDE.md cost-controls).
 REALTIME_POST_INSTRUCTIONS_TOKENS = int(
-    os.getenv("REALTIME_POST_INSTRUCTIONS_TOKENS", "24000")
+    os.getenv("REALTIME_POST_INSTRUCTIONS_TOKENS", "48000")
 )
 # Operator's first name — used in prompts and tool-schema descriptions so the
 # model addresses them naturally instead of saying "the user". Default keeps
@@ -78,6 +89,50 @@ OPERATOR_NAME = os.getenv("OPERATOR_NAME", "the user").strip() or "the user"
 # toward. Improves recognition of names/jargon you say often (people, products,
 # acronyms). Empty default; personal deployments populate via .env.
 OPENAI_REALTIME_TRANSCRIPTION_HINTS = os.getenv("OPENAI_REALTIME_TRANSCRIPTION_HINTS", "").strip()
+
+
+def _account_label(addr: str) -> str:
+    """Human label for a Google Workspace address so the model can map
+    'my personal email' / 'crunchy' / 'flowocity' to a real account. Custom
+    domains use the domain stem; gmail uses 'personal' for the default account
+    and the local handle for any others (avoids two indistinct 'personal's)."""
+    local, _, domain = addr.partition("@")
+    if domain and domain != "gmail.com":
+        return domain.split(".")[0]  # crunchy.tools -> crunchy, flowocity.ai -> flowocity
+    if addr == GWS_DEFAULT_ACCOUNT:
+        return "personal"
+    return (local.split(".")[0] or "gmail")  # jerome.cbmb -> jerome
+
+
+def _gws_account_desc() -> str:
+    """Tool-schema description for the `account` arg, enumerating the REAL
+    configured accounts (not the env-var name) so the model stops inventing
+    addresses. Falls back to a generic line when none are configured."""
+    if not GWS_ALLOWED_ACCOUNTS:
+        return "The Google Workspace account to query. Omit to use the default."
+    listed = ", ".join(f"{a} ({_account_label(a)})" for a in sorted(GWS_ALLOWED_ACCOUNTS))
+    default = GWS_DEFAULT_ACCOUNT or "the first configured"
+    return (
+        f"Which Google Workspace account to query. Configured accounts: {listed}. "
+        f"Use these EXACT addresses — never guess or invent one. Omit to use the "
+        f"default ({default})."
+    )
+
+
+def _accounts_brief() -> str | None:
+    """Markdown block listing the real account roster, injected into session
+    instructions so the model always knows which inboxes/calendars exist."""
+    if not GWS_ALLOWED_ACCOUNTS:
+        return None
+    lines = [f"- {a} — {_account_label(a)}" for a in sorted(GWS_ALLOWED_ACCOUNTS)]
+    default = GWS_DEFAULT_ACCOUNT or sorted(GWS_ALLOWED_ACCOUNTS)[0]
+    return (
+        "## Google Workspace accounts\n"
+        "These are the ONLY email/calendar accounts that exist. Use the exact "
+        "address; never invent one. When searching for a person's mail and the "
+        f"default account ({default}) returns nothing, fan out across the others "
+        "before concluding it isn't there.\n" + "\n".join(lines)
+    )
 AGENT_API_BASE = os.getenv("AGENT_API_BASE", "http://127.0.0.1:8642").rstrip("/")
 # Liveness model for ask_agent forwards:
 #   - ASK_AGENT_IDLE_TIMEOUT_SEC: primary watchdog, surfaced via httpx's `read`
@@ -134,6 +189,7 @@ def _ensure_conv_shape(conv: Dict[str, Any]) -> None:
     server versions don't KeyError after a code update."""
     conv.setdefault("entries", [])
     conv.setdefault("last_activity_ts", conv.get("started_at", time.time()))
+    conv.setdefault("research_inflight", set())  # in-flight deep_research call_ids
 
 
 # Granular tool schemas. Each fans out to a direct backend (Supabase / gws /
@@ -213,7 +269,7 @@ CALENDAR_SCHEMA = {
             },
             "account": {
                 "type": "string",
-                "description": "The Google Workspace account to query (one of those configured via GWS_ALLOWED_ACCOUNTS). Omit to use the default.",
+                "description": _gws_account_desc(),
             },
         },
         "required": [],
@@ -234,7 +290,7 @@ GMAIL_SEARCH_SCHEMA = {
             "query": {"type": "string", "description": "Gmail search syntax"},
             "account": {
                 "type": "string",
-                "description": "The Google Workspace account to query (one of those configured via GWS_ALLOWED_ACCOUNTS). Omit to use the default.",
+                "description": _gws_account_desc(),
             },
             "limit": {"type": "integer", "description": "Max results (1–25)", "default": 10},
         },
@@ -307,6 +363,29 @@ DEEP_RESEARCH_TOOL_SCHEMA = {
     },
 }
 
+CANCEL_RESEARCH_TOOL_SCHEMA = {
+    "type": "function",
+    "name": "cancel_research",
+    "description": (
+        "Stop deep_research that's currently running. Call this when the user "
+        "redirects mid-research ('stop that', 'actually, look at X instead') or "
+        "no longer wants the result. Frees you to start the new task immediately. "
+        "By default cancels ALL in-flight research. Note: this stops you from "
+        "waiting/narrating; a side-effecting action the agent already started may "
+        "still finish on its own — don't claim it was undone."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "reason": {
+                "type": "string",
+                "description": "Brief why, for the log (e.g. 'user redirected to pricing').",
+            },
+        },
+        "required": [],
+    },
+}
+
 RECALL_RECENT_CALL_SCHEMA = {
     "type": "function",
     "name": "recall_recent_call",
@@ -341,6 +420,7 @@ _ALL_TOOLKIT_SCHEMAS = [
     MISSION_CONTROL_CARD_SCHEMA,
     RECALL_RECENT_CALL_SCHEMA,
     DEEP_RESEARCH_TOOL_SCHEMA,
+    CANCEL_RESEARCH_TOOL_SCHEMA,
 ]
 
 
@@ -508,6 +588,12 @@ TOOL-CALL DOCTRINE:
    Partial findings stream in as `[research-finding] section=…` system
    messages — narrate them as they arrive; don't claim completion until
    you receive the function_call_output.
+5b. You CAN run multiple `deep_research` tasks at once. If the user raises a
+   second, independent task while one is already running, launch it in
+   parallel — do NOT refuse with "one at a time" or make them wait. The only
+   thing to avoid is firing the SAME request twice concurrently. When the user
+   redirects mid-research ("stop that, do X instead") or no longer wants a
+   running result, call `cancel_research` to stop it, then start the new task.
 6. ANTI-FABRICATION: never invent user-specific facts. If you're unsure
    whether the dossier or a prior tool result covers a name, date, file,
    commitment, or decision, escalate to a tool rather than guess. "I'd
@@ -575,12 +661,20 @@ def _new_conv_id() -> str:
     return secrets.token_urlsafe(12)
 
 
-async def _agent_chat_stream(conv_id: str, user_text: str):
+async def _agent_chat_stream(conv_id: str, user_text: str, *, session_suffix: str = ""):
     """Async generator yielding agent SSE chunks as they arrive.
 
     Used by `/api/deep-research` to emit section milestones mid-stream and
     by `_agent_chat_collect` to assemble a final string (dossier refresh,
     post-call extraction, /api/text-turn).
+
+    `session_suffix` is appended to the `X-Session-Id` (`voice-{conv_id}{suffix}`)
+    so a SECOND, concurrent deep_research on the same call lands in a distinct
+    backend session — the agent stores history server-side keyed by this header,
+    and two concurrent turns on one session id would interleave its working
+    state. Independent parallel tasks don't need shared context, so isolating
+    them is the safe default. Empty suffix (the sole/first call) keeps the base
+    session for continuity across sequential turns.
 
     Liveness model:
       - httpx `read` timeout = ASK_AGENT_IDLE_TIMEOUT_SEC (raises ReadTimeout
@@ -604,7 +698,7 @@ async def _agent_chat_stream(conv_id: str, user_text: str):
             f"{AGENT_API_BASE}/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {AGENT_API_KEY}",
-                "X-Session-Id": f"voice-{conv_id}",
+                "X-Session-Id": f"voice-{conv_id}{session_suffix}",
                 "Content-Type": "application/json",
                 "Accept": "text/event-stream",
             },
@@ -804,7 +898,17 @@ async def _mint_realtime_session(
         "language": "en",
     }
     if OPENAI_REALTIME_TRANSCRIPTION_HINTS:
-        transcription_cfg["prompt"] = OPENAI_REALTIME_TRANSCRIPTION_HINTS
+        # Phrase the bias hint as a natural sentence rather than a bare
+        # comma-list. A raw keyword dump gets echoed back verbatim by
+        # gpt-4o-mini-transcribe on the opening silence/breath, which the
+        # model then treats as a real user turn (the "I didn't say that"
+        # bug). A sentence is far less prone to verbatim echo. The client
+        # also drops a first-turn transcript that matches the hint string
+        # (belt-and-suspenders) — see app.js hint-echo guard.
+        transcription_cfg["prompt"] = (
+            f"The speaker often mentions these names and terms: "
+            f"{OPENAI_REALTIME_TRANSCRIPTION_HINTS}."
+        )
     body = {
         "session": {
             "type": "realtime",
@@ -892,7 +996,11 @@ async def session_mint(request: web.Request) -> web.Response:
     memory_blocks = voice_memory.render_memory_sources_markdown()
     transcript_index_block = voice_memory.render_transcript_index_markdown()
     honcho_block = honcho_voice.render_mint_context_block(conv_id)
-    suffixes = [dossier_md, triage_suffix, honcho_block, *memory_blocks, transcript_index_block]
+    # Real GWS account roster so the model never invents addresses (e.g.
+    # "ggurevich.gary@…") and knows to fan out across inboxes. None when no
+    # GWS accounts are configured.
+    accounts_block = _accounts_brief()
+    suffixes = [dossier_md, triage_suffix, accounts_block, honcho_block, *memory_blocks, transcript_index_block]
     # Conservative cross-layer dedupe (line-level, normalized). Earlier suffixes
     # win; later layers drop verbatim restatements. Expected v1 impact is
     # near-zero — dropped_count is the measurement signal.
@@ -901,7 +1009,7 @@ async def session_mint(request: web.Request) -> web.Response:
     # would push us over ~14k tokens, drop it rather than fail the mint.
     if sum(len(s or "") for s in suffixes) // 4 > 14000 and honcho_block:
         log.warning("dropping honcho_block to stay under instructions cap (conv=%s)", conv_id)
-        suffixes = [dossier_md, triage_suffix, *memory_blocks, transcript_index_block]
+        suffixes = [dossier_md, triage_suffix, accounts_block, *memory_blocks, transcript_index_block]
         suffixes, _ = _dedupe_context_layers(suffixes)
         honcho_block = ""
     try:
@@ -935,6 +1043,8 @@ async def session_mint(request: web.Request) -> web.Response:
         })
     if triage_suffix:
         sources_meta.append({"name": "triage_brief", "chars": len(triage_suffix)})
+    if accounts_block:
+        sources_meta.append({"name": "accounts", "chars": len(accounts_block)})
     if honcho_block:
         sources_meta.append({"name": "honcho", "chars": len(honcho_block)})
     for header, block in zip(memory_sources_loaded, memory_blocks):
@@ -980,6 +1090,9 @@ async def session_mint(request: web.Request) -> web.Response:
     return web.json_response({
         "conv_id": conv_id, "session": data, "mode": mode or "default",
         "operator_name": OPERATOR_NAME,
+        # Raw hint string so the client can drop a first-turn transcript that
+        # is just the transcriber echoing it back (see app.js hint-echo guard).
+        "transcription_hint": OPENAI_REALTIME_TRANSCRIPTION_HINTS,
     })
 
 
@@ -1077,7 +1190,10 @@ def _build_toolkit() -> tuple[list, dict, dict]:
         register (filesystem ripgrep, local-file recall, agent backend or
         stub) — these have no external dependency to gate on.
     """
-    available = {"search_notes", "recall_recent_call", "deep_research"}
+    # cancel_research is handled entirely client-side (aborts the in-flight
+    # /api/deep-research fetch); it has no _TOOL_DISPATCH backend, so it rides
+    # along in the schema set but never appears in `dispatch`.
+    available = {"search_notes", "recall_recent_call", "deep_research", "cancel_research"}
     try:
         from backends.supabase import _creds as _supabase_creds
         url, key = _supabase_creds()
@@ -1188,6 +1304,7 @@ async def deep_research(request: web.Request) -> web.Response:
     prompt = (body.get("prompt") or "").strip()
     scope = (body.get("scope") or "reasoning").strip()
     expected_seconds = body.get("expected_seconds")
+    call_id = (body.get("call_id") or secrets.token_hex(4)).strip()
     conv = CONVERSATIONS.get(conv_id) if conv_id else None
     if conv is None:
         return web.json_response({"error": "unknown_conv_id"}, status=400)
@@ -1196,9 +1313,17 @@ async def deep_research(request: web.Request) -> web.Response:
         return web.json_response({"error": "empty_prompt"}, status=400)
     _touch(conv)
     started_at = time.time()
+    # Concurrency: if another deep_research is already running on this call,
+    # isolate this one in its own backend session so the agent's per-session
+    # working state can't interleave (see _agent_chat_stream docstring). The
+    # first/sole task keeps the base session for cross-turn continuity.
+    inflight: set = conv.setdefault("research_inflight", set())
+    session_suffix = f"#{call_id}" if inflight else ""
+    inflight.add(call_id)
     log_call_event(
         LOG_DIR, conv_id, "deep_research_spawned",
         chars=len(prompt), scope=scope, expected_seconds=expected_seconds,
+        call_id=call_id, concurrent=bool(session_suffix), inflight_n=len(inflight),
     )
 
     resp = web.StreamResponse(
@@ -1234,7 +1359,7 @@ async def deep_research(request: web.Request) -> web.Response:
     status = "done"
     error_type: str | None = None
     try:
-        async for piece in _agent_chat_stream(conv_id, prompt):
+        async for piece in _agent_chat_stream(conv_id, prompt, session_suffix=session_suffix):
             chunks.append(piece)
             pending_buffer += piece
             # Section boundary: line starting with `## ` (Markdown H2).
@@ -1264,6 +1389,12 @@ async def deep_research(request: web.Request) -> web.Response:
     except Exception as e:  # noqa: BLE001
         log.exception("deep_research stream failed")
         status = "error"; error_type = type(e).__name__
+    finally:
+        # Free the slot whether we finished, errored, or were cancelled by a
+        # client abort (cancel_research / disconnect). CancelledError is a
+        # BaseException, so it isn't swallowed by `except Exception` above — it
+        # propagates out after this runs, closing the httpx stream to Hermes.
+        inflight.discard(call_id)
     # Flush any trailing buffered section text as a final milestone before done.
     if pending_buffer.strip() and pending_section:
         await _emit_milestone(pending_section, pending_buffer.strip())
@@ -1282,8 +1413,13 @@ async def deep_research(request: web.Request) -> web.Response:
     conv["entries"].append({"role": "tool_question", "text": prompt, "ts": started_at})
     conv["entries"].append({"role": "tool_answer", "text": answer, "ts": finished_at})
     conv["last_activity_ts"] = finished_at
-    await _send({"type": "done", "answer": answer, "status": status, "error_type": error_type})
-    await resp.write_eof()
+    try:
+        await _send({"type": "done", "answer": answer, "status": status, "error_type": error_type})
+        await resp.write_eof()
+    except (ConnectionResetError, ConnectionError):
+        # Client aborted (e.g. cancel_research) before we flushed the final
+        # event. Nothing to do — the transcript turn above is already recorded.
+        pass
     return resp
 
 

@@ -48,10 +48,26 @@ let resumeInFlight = false;
 let watchdogTimer = null;
 
 // --- Forced-reconnect continuity state ---
-// `responseInFlight` flips on response.created and back on response.done. The
-// handoff-note request is gated on it being false (one outstanding response at
-// a time per Realtime contract).
+// `responseInFlight` flips true when we send a response.create (set
+// synchronously to close the race window), stays true through response.created,
+// and back to false on response.done. The Realtime API processes ONE response
+// at a time — a second response.create while one is active throws
+// `conversation_already_has_active_response`. So every response.create in this
+// client goes through `requestResponse()`, which fires when idle or queues
+// otherwise; `response.done` drains the queue. This is what makes parallel
+// deep_research returns + OOB narration + the opener safe to overlap.
 let responseInFlight = false;
+const responseQueue = []; // queued response.create payloads, drained on response.done
+
+// In-flight deep_research streams: call_id -> { controller, chipDiv }. Lets
+// cancel_research abort the fetch(es) and is the single arbiter that prevents a
+// double function_call_output (cancel sends it; handleDeepResearch's abort path
+// then skips).
+const activeResearch = new Map();
+
+// Raw transcription-hint string from /api/session, used to drop a first-turn
+// transcript that is just the transcriber echoing the bias prompt back.
+let transcriptionHint = "";
 // Single in-flight handoff request: { responseId, buffer, resolve, t0 }.
 // `responseId` is null until response.created arrives, then bound to the real id
 // so subsequent response.text.delta events route to the right buffer.
@@ -265,37 +281,51 @@ function isErrorAnswer(answer) {
   return typeof answer === "string" && answer.startsWith("Agent is temporarily unreachable");
 }
 
+// Token set for echo detection (lowercase, punctuation-stripped).
+function _wordTokens(s) {
+  return (s || "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ").split(/\s+/).filter(Boolean);
+}
+// True when `text` is mostly the transcription bias prompt echoed back by the
+// transcriber on opening silence (the "I didn't say that" bug). Only meaningful
+// for the first turn; ≥70% token overlap with the hint string.
+function isHintEcho(text) {
+  if (!transcriptionHint) return false;
+  const hint = new Set(_wordTokens(transcriptionHint));
+  if (!hint.size) return false;
+  const toks = _wordTokens(text);
+  if (toks.length < 3) return false;
+  let overlap = 0;
+  for (const t of toks) if (hint.has(t)) overlap++;
+  return overlap / toks.length >= 0.7;
+}
+
 // --------------- Icebreaker (comfort bed during ask_agent) ---------------
 
 function createBrownNoiseIcebreaker(ctx) {
-  const len = ctx.sampleRate * 2;
-  const buf = ctx.createBuffer(1, len, ctx.sampleRate);
-  const ch = buf.getChannelData(0);
-  let last = 0;
-  for (let i = 0; i < len; i++) {
-    const white = Math.random() * 2 - 1;
-    last = (last + 0.02 * white) / 1.02;
-    ch[i] = last * 3.5;
-  }
-  const src = ctx.createBufferSource();
-  src.buffer = buf; src.loop = true;
+  // Soft warm pad, not brown noise. Gary found the old low-passed noise bed
+  // "creepy / breathing-like" on reconnect. This is a quiet two-oscillator
+  // sine drone (a low root + a fifth, slightly detuned) behind a gentle
+  // low-pass — a steady, neutral "hold" tone with no amplitude pulsing.
+  const osc1 = ctx.createOscillator();
+  osc1.type = "sine"; osc1.frequency.value = 120;       // low root
+  const osc2 = ctx.createOscillator();
+  osc2.type = "sine"; osc2.frequency.value = 180.6;     // fifth, +~0.6Hz detune for warmth
   const lp = ctx.createBiquadFilter();
-  lp.type = "lowpass"; lp.frequency.value = 200; lp.Q.value = 0.7;
+  lp.type = "lowpass"; lp.frequency.value = 500; lp.Q.value = 0.3;
   const master = ctx.createGain(); master.gain.value = 0;
-  src.connect(lp).connect(master).connect(ctx.destination);
-  src.start();
-  // Keep the procedural fallback steady: avoid any amplitude pulse that can read
-  // as breathing/heartbeat while the app is bridging a silent reconnect gap.
-  // setTargetAtTime matches createSampleIcebreaker's idiom and self-supersedes,
-  // so overlapping fades re-aim from the live value without colliding (no manual
-  // cancel/anchor, and no implementation-dependent .value read mid-ramp).
-  const fade = (target, dur = 0.25) =>
+  osc1.connect(lp); osc2.connect(lp);
+  lp.connect(master).connect(ctx.destination);
+  osc1.start(); osc2.start();
+  // Slow, steady fades — no amplitude pulse. setTargetAtTime self-supersedes so
+  // overlapping fades re-aim from the live value without colliding. Target gain
+  // is much lower than the old bed (≈0.05 vs 0.24): present but unobtrusive.
+  const fade = (target, dur = 0.6) =>
     master.gain.setTargetAtTime(target, ctx.currentTime, dur / 3);
   return {
-    fadeIn: () => fade(0.24),
+    fadeIn: () => fade(0.05),
     fadeOut: () => fade(0.0),
     dispose: () => {
-      try { src.stop(); src.disconnect(); lp.disconnect(); master.disconnect(); } catch {}
+      try { osc1.stop(); osc2.stop(); osc1.disconnect(); osc2.disconnect(); lp.disconnect(); master.disconnect(); } catch {}
     },
   };
 }
@@ -353,6 +383,11 @@ async function attachPeer(session, resumeContext) {
   firstAudioFrameSeen = false;
   // Don't carry a stale speech-stop anchor across a cap-swap / forced reconnect.
   lastSpeechStoppedTs = null;
+  // A new peer has no active response, and any response.create queued against
+  // the old peer is invalid — reset the gated-dispatcher state so it can't
+  // strand the queue or fire a stale create on the fresh data channel.
+  responseInFlight = false;
+  responseQueue.length = 0;
 
   const newPc = new RTCPeerConnection();
   newPc.onconnectionstatechange = () => onConnectionStateChange(newPc);
@@ -428,6 +463,7 @@ async function startCall() {
   convId = session.conv_id;
   sessionMode = session.mode || "default";
   operatorName = session.operator_name || "the user";
+  transcriptionHint = session.transcription_hint || "";
   try {
     await attachPeer(session, null);
   } catch (e) {
@@ -473,12 +509,9 @@ function onDcOpen(resumeContext) {
     // need a mode-aware opener that points the model at the brief.
     const openerInstructions =
       sessionMode === "triage"
-        ? "Open the triage call: state loop [1]'s BLUF in <=8 words, then ask 'Drop, park, or act?'. Do not greet. Do not preamble. Do not call ask_agent — everything you need is in your system instructions."
+        ? "Open the triage call on loop [1]. First give 2–4 sentences of grounding so the user can place it: what it's about, why it surfaced, and where it stands — pull from the loop's BLUF and source blob in your instructions. THEN ask how to handle it, phrased naturally for this loop (e.g. 'want to kill it, park it, or do something with it now?'). Do NOT lead with 'drop, park, or act?'. Do not greet or preamble. Everything you need is in your system instructions — do not call deep_research."
         : "Greet the user briefly in English. Just one sentence.";
-    send({
-      type: "response.create",
-      response: { output_modalities: ["audio"], instructions: openerInstructions },
-    });
+    requestResponse({ output_modalities: ["audio"], instructions: openerInstructions });
     return;
   }
   // Resume path: handoff-note instructions suffix carries continuity. semantic_vad
@@ -575,7 +608,7 @@ async function requestHandoffNote(reason) {
           "No greeting, no flattery, no filler. Output only the note." }],
       },
     }));
-    dc.send(JSON.stringify({ type: "response.create", response: { output_modalities: ["text"] } }));
+    requestResponse({ output_modalities: ["text"] });
   } catch (e) {
     activeHandoffRequest = null;
     logClientEvent("client_handoff_note_failed", { reason, error: String(e) });
@@ -842,6 +875,15 @@ function onDcMessage(ev) {
       const text = (msg.transcript || userTranscriptBuf || "").trim();
       userTranscriptBuf = "";
       if (text) {
+        // Drop a first-turn transcript that's just the transcriber echoing the
+        // bias-hint prompt back on opening silence. Don't render it, don't
+        // record it, and cancel any monologue it triggered.
+        const isFirstTurn = !clientEntries.some((e) => e.role === "user" || e.role === "assistant");
+        if (isFirstTurn && isHintEcho(text)) {
+          logClientEvent("client_dropped_hint_echo", { chars: text.length });
+          if (responseInFlight) send({ type: "response.cancel" });
+          break;
+        }
         const userDoneTs = Date.now();
         turnTiming.userDoneTs = userDoneTs;
         turnTiming.firstTokenTs = null;
@@ -913,6 +955,9 @@ function onDcMessage(ev) {
 
     case "response.done": {
       responseInFlight = false;
+      // Fire the next queued response.create (parallel deep_research returns,
+      // OOB narration) now that the slot is free.
+      drainResponseQueue();
       // Forward the Realtime usage block so the server can derive per-call cost
       // and cache-hit ratio (the single biggest cost lever). Fields per OpenAI
       // docs; absent on older models — log null and move on.
@@ -948,8 +993,27 @@ function onDcMessage(ev) {
         triggerResume("openai_session_expired", { silent: true });
         break;
       }
-      console.error("realtime error:", msg);
-      setStatus("realtime error", "error");
+      // Defensive: a rejected response.create yields no response.done, which
+      // would strand responseInFlight=true and stall the queue. If a create
+      // looks to have failed, free the slot and drain. (A genuinely active
+      // response would have cleared via response.done already.)
+      if (responseInFlight && (code === "conversation_already_has_active_response" || msg.error?.type === "invalid_request_error")) {
+        responseInFlight = false;
+        drainResponseQueue();
+      }
+      // Don't flip the whole UI to a red "realtime error" for recoverable API
+      // errors — especially mid-research, where a transient blip is expected
+      // and the "Researching…" chip is the real signal. Fatal connection loss
+      // is handled by the pc connection-state path, not here.
+      const benign = code === "conversation_already_has_active_response"
+        || code === "response_cancel_not_active"
+        || activeResearch.size > 0;
+      if (benign) {
+        logClientEvent("client_realtime_error_suppressed", { code, research_active: activeResearch.size });
+      } else {
+        console.error("realtime error:", msg);
+        setStatus("realtime error", "error");
+      }
       break;
     }
 
@@ -962,9 +1026,39 @@ function onDcMessage(ev) {
 function send(obj) {
   if (dc && dc.readyState === "open") dc.send(JSON.stringify(obj));
 }
+
+// Gated response.create dispatcher. Fires immediately when no response is
+// active; otherwise queues until response.done drains it. `responseOpts` is the
+// optional `response` field (modalities, instructions, conversation:"none" for
+// OOB narration). ALL response.create sites route through here so they can't
+// collide and trigger `conversation_already_has_active_response`.
+function requestResponse(responseOpts) {
+  const payload = { type: "response.create" };
+  if (responseOpts) payload.response = responseOpts;
+  if (responseInFlight) {
+    responseQueue.push(payload);
+    logClientEvent("client_response_queued", {
+      depth: responseQueue.length,
+      oob: !!(responseOpts && responseOpts.conversation === "none"),
+    });
+    return;
+  }
+  if (!dc || dc.readyState !== "open") return;
+  responseInFlight = true; // synchronous — closes the race before response.created
+  send(payload);
+}
+
+function drainResponseQueue() {
+  if (responseInFlight || !responseQueue.length) return;
+  const next = responseQueue.shift();
+  if (!dc || dc.readyState !== "open") return;
+  responseInFlight = true;
+  send(next);
+}
+
 function sendFunctionOutput(call_id, output) {
   send({ type: "conversation.item.create", item: { type: "function_call_output", call_id, output } });
-  send({ type: "response.create" });
+  requestResponse();
 }
 
 // Tool dispatch: route a completed function_call to the right handler.
@@ -981,6 +1075,8 @@ function dispatchToolCall(callId, name, args) {
     handleNarrowTool(callId, name, args);
   } else if (name === "deep_research") {
     handleDeepResearch(callId, args);
+  } else if (name === "cancel_research") {
+    handleCancelResearch(callId, args);
   } else if (name === "triage_verdict") {
     handleTriageVerdict(callId, args);
   } else {
@@ -1047,6 +1143,26 @@ async function handleDeepResearch(callId, args) {
   let lastNarrationTs = 0;
   let chipEntry = consultingChips.get(callId);
 
+  // Register for cancellation. The AbortController lets cancel_research stop
+  // the fetch; the map is the single arbiter that prevents a double output.
+  const controller = new AbortController();
+  activeResearch.set(callId, { controller, chipDiv: chipEntry?.chipDiv });
+
+  // Live progress on the chip: "Researching… (Ns)" baseline, upgraded to the
+  // latest milestone, always with elapsed seconds so the user can SEE it's
+  // working (the prior silence read as a hang / "realtime error"). Writes the
+  // text element directly to avoid the generic "Consulting deep context:" prefix.
+  const startedAt = Date.now();
+  let chipBase = "Researching…";
+  function paintChip() {
+    const div = chipEntry?.chipDiv;
+    if (!div || !div._textEl) return;
+    const secs = Math.round((Date.now() - startedAt) / 1000);
+    div._textEl.textContent = `${chipBase} (${secs}s)`;
+  }
+  const chipTimer = setInterval(paintChip, 1000);
+  paintChip();
+
   function injectMilestone(section, text) {
     if (!dc || dc.readyState !== "open") return;
     // Client-side floor on injection rate. Server is already 3s-throttled,
@@ -1064,28 +1180,26 @@ async function handleDeepResearch(callId, args) {
             text: `[research-finding] section=${section}: ${text}` }],
         },
       }));
-      // 2. Out-of-band response.create so the model audibly narrates the
-      //    finding without polluting the main conversation history or
-      //    interrupting the pending function call. Throttled separately
-      //    from milestone ingestion — narrating every milestone would be
-      //    too chatty; ~10s between spoken updates is the floor.
+      // 2. Out-of-band narration so the model audibly reports the finding
+      //    without polluting main history. Routed through requestResponse so it
+      //    can't collide with a parallel deep_research return (one active
+      //    response at a time). Throttled separately — ~10s between spoken
+      //    updates so longer researches don't get chatty.
       if (now - lastNarrationTs >= 10000) {
         lastNarrationTs = now;
-        dc.send(JSON.stringify({
-          type: "response.create",
-          response: {
-            conversation: "none",
-            output_modalities: ["audio"],
-            instructions:
-              `Briefly tell ${operatorName} what you just found, in one short sentence. ` +
-              `Section: ${section}. Finding: ${text}. ` +
-              `Don't summarize the whole research — just this one update. ` +
-              `Stay conversational; don't restate the user's question.`,
-          },
-        }));
+        requestResponse({
+          conversation: "none",
+          output_modalities: ["audio"],
+          instructions:
+            `Briefly tell ${operatorName} what you just found, in one short sentence. ` +
+            `Section: ${section}. Finding: ${text}. ` +
+            `Don't summarize the whole research — just this one update. ` +
+            `Stay conversational; don't restate the user's question.`,
+        });
       }
     } catch {}
-    if (chipEntry) updateConsultingChip(chipEntry.chipDiv, `Researching · ${section}: ${text}`);
+    chipBase = `Researching · ${section}: ${text}`.slice(0, 80);
+    paintChip();
   }
 
   let status = "done";
@@ -1094,7 +1208,9 @@ async function handleDeepResearch(callId, args) {
     const r = await fetch("/api/deep-research", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ conv_id: convId, ...args }),
+      // call_id lets the server isolate the backend session for concurrent runs.
+      body: JSON.stringify({ conv_id: convId, call_id: callId, ...args }),
+      signal: controller.signal,
     });
     if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
     const reader = r.body.getReader();
@@ -1124,12 +1240,24 @@ async function handleDeepResearch(callId, args) {
       }
     }
   } catch (e) {
+    if (controller.signal.aborted) {
+      // Cancelled via cancel_research — that path already sent the
+      // function_call_output and closed the chip. Don't send a second output
+      // (double output → invalid_request_error) or paint a bubble.
+      clearInterval(chipTimer);
+      return;
+    }
     status = "error";
     errorType = "client_network";
     assembled = `Agent is temporarily unreachable - ${e.message || e}`;
   } finally {
+    clearInterval(chipTimer);
     closeConsultingChip(callId);
   }
+  // Single arbiter for the function_call_output: whoever wins the atomic
+  // delete() emits. If cancel_research already finalized this call (sent the
+  // cancelled output), delete() returns false and we bail — no double output.
+  if (!activeResearch.delete(callId)) return;
   if (isErrorAnswer(assembled)) {
     appendBubble("system", assembled || "(no answer)");
   } else {
@@ -1137,6 +1265,25 @@ async function handleDeepResearch(callId, args) {
   }
   sendFunctionOutput(callId, assembled ||
     "Agent is temporarily unreachable - please ask the user to repeat that.");
+}
+
+// cancel_research: stop all in-flight deep_research. Aborts each fetch and
+// sends its function_call_output (so Realtime's "every function_call needs an
+// output" contract is satisfied), then answers the cancel_research call itself.
+// The activeResearch map is deleted-from here BEFORE abort so handleDeepResearch's
+// abort path is a no-op (single-arbiter — avoids a double output).
+function handleCancelResearch(callId, args) {
+  const cancelled = [];
+  for (const [rid, entry] of Array.from(activeResearch.entries())) {
+    // Atomic claim — if handleDeepResearch already finalized this call, skip.
+    if (!activeResearch.delete(rid)) continue;
+    try { entry.controller.abort(); } catch {}
+    closeConsultingChip(rid);
+    sendFunctionOutput(rid, JSON.stringify({ status: "cancelled" }));
+    cancelled.push(rid);
+  }
+  logClientEvent("client_cancel_research", { count: cancelled.length, reason: (args && args.reason) || "" });
+  sendFunctionOutput(callId, JSON.stringify({ cancelled: cancelled.length }));
 }
 
 // Human-readable summary of a narrow-tool result for the display bubble.
@@ -1309,6 +1456,7 @@ textForm.addEventListener("submit", async (ev) => {
       const d = await r.json();
       convId = d.conv_id;
       operatorName = d.operator_name || operatorName;
+      transcriptionHint = d.transcription_hint || transcriptionHint;
     } catch (e) {
       appendBubble("system", `Session mint failed: ${e.message}`);
       return;

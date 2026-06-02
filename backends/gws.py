@@ -39,6 +39,18 @@ def _local_tz() -> timezone:
         return timezone.utc
 
 
+def _check_account(acct: str) -> dict | None:
+    """Return a structured error if `acct` isn't a configured account, else None.
+
+    Surfacing the valid roster (instead of a silent failure) lets the voice
+    model self-correct when it guessed/invented an address — the prior behavior
+    was an empty result it would misread as "no mail from that person."
+    """
+    if ALLOWED_ACCOUNTS and acct not in ALLOWED_ACCOUNTS:
+        return {"error": "unknown_account", "requested": acct, "valid": sorted(ALLOWED_ACCOUNTS)}
+    return None
+
+
 async def _run_gws(account: str, args: list[str], *, timeout_s: float = 8.0) -> dict | list | None:
     """Spawn the wrapper, parse JSON stdout. Returns None on failure (caller decides)."""
     if not GWS_WRAPPER.exists():
@@ -132,6 +144,8 @@ async def calendar(when: str | None = None, account: str | None = None) -> list[
     bare email list (organizer included if not the account holder).
     """
     acct = account or DEFAULT_ACCOUNT
+    if (err := _check_account(acct)) is not None:
+        return err
     time_min, time_max = _resolve_when(when)
     params = {
         "calendarId": "primary",
@@ -176,6 +190,8 @@ async def gmail_search(query: str, account: str | None = None,
     if not query or not query.strip():
         return {"error": "empty_query"}
     acct = account or DEFAULT_ACCOUNT
+    if (err := _check_account(acct)) is not None:
+        return err
     list_params = {"userId": "me", "q": query.strip(), "maxResults": int(max(1, min(limit, 25)))}
     listed = await _run_gws(acct, ["gmail", "users", "messages", "list",
                                    "--params", json.dumps(list_params)])
