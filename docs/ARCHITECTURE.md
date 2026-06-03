@@ -63,11 +63,12 @@ Substantive turns split into two paths. The model is told to prefer the narrowes
 
 ### `deep_research` (30–240s, streaming SSE)
 
-1. User asks something that genuinely requires the slow path. Model calls `deep_research(prompt, scope, expected_seconds)` and tells the user roughly how long ("this'll take about a minute, I'll narrate as I go").
+1. User asks something that genuinely requires the slow path. Model calls `deep_research(prompt, scope, expected_seconds)` and sets expectations honestly: give a rough duration only when there is a decent estimate; otherwise say you'll work on it and report back.
 2. Browser POSTs `/api/deep-research`, reads the SSE stream.
 3. Sidecar streams chunks from `_agent_chat_stream`, detects markdown section boundaries (`\n## ` headers), and emits `{type:"milestone", section, text}` events on a 3-second server-side throttle.
 4. Browser injects each milestone into the Realtime conversation as a system message: `{type:"conversation.item.create", item:{role:"system", content:[{type:"input_text", text:"[research-finding] section=…: …"}]}}`. The voice model narrates progress between utterances; the consulting chip ticks through latest section.
-5. On the final `{type:"done", answer}`, browser sends `function_call_output` with the assembled answer. Model speaks the synthesis.
+5. If no milestone arrives for roughly a minute, the browser asks the voice model for a one-sentence progress cue so the wait does not feel broken. These cues must avoid duration guesses unless the model actually knows one.
+6. On the final `{type:"done", answer}`, browser sends `function_call_output` with the assembled answer. Model speaks the synthesis.
 
 ## Flow: backgrounding / forced reconnect
 

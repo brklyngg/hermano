@@ -325,8 +325,9 @@ DEEP_RESEARCH_TOOL_SCHEMA = {
         "drafting, or synthesis. The agent backend has full filesystem access, "
         "Gmail draft / Calendar write, and shell tools — use this tool for any "
         f"user request that requires *doing* something on {OPERATOR_NAME}'s machine, not just "
-        "looking something up. Typically 30–240 seconds. Tell the user roughly "
-        "how long ('this'll take about a minute, I'll narrate as I go'). Partial "
+        "looking something up. Typically 30–240 seconds, but some tasks can run "
+        "longer. Give an honest rough estimate only when you have one; otherwise "
+        "say you'll work on it and report back. Don't default to 'about a minute'. Partial "
         "findings stream in via `[research-finding]` system messages — narrate "
         "them; don't claim completion until you receive the function_call_output. "
         "When the work includes an action, the function_call_output will include "
@@ -583,8 +584,10 @@ TOOL-CALL DOCTRINE:
    calendar… ok now let me check your email."
 4. Prefer in-session reasoning when the answer is already in the dossier
    or a prior tool result this call. Don't re-fetch what's in your context.
-5. `deep_research` is the slow path. When you call it: TELL the user
-   roughly how long ("this'll take about a minute, I'll narrate as I go").
+5. `deep_research` is the slow path. When you call it: set expectations
+   honestly. Give a rough duration only when you have a decent estimate;
+   otherwise say you'll work on it and report back. Do NOT default to
+   "about a minute" as filler.
    Partial findings stream in as `[research-finding] section=…` system
    messages — narrate them as they arrive; don't claim completion until
    you receive the function_call_output.

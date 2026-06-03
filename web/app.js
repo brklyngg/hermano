@@ -1141,6 +1141,7 @@ async function handleDeepResearch(callId, args) {
   let assembled = "";
   let lastMilestoneInjectedTs = 0;
   let lastNarrationTs = 0;
+  let lastProgressCueTs = 0;
   let chipEntry = consultingChips.get(callId);
 
   // Register for cancellation. The AbortController lets cancel_research stop
@@ -1162,6 +1163,25 @@ async function handleDeepResearch(callId, args) {
   }
   const chipTimer = setInterval(paintChip, 1000);
   paintChip();
+
+  // If the backend has no milestone-worthy finding for a while, give a tiny
+  // audio heartbeat so long waits don't feel like a broken connection. This is
+  // deliberately content-free and infrequent; real milestone narration still
+  // wins whenever it is available.
+  const progressCueTimer = setInterval(() => {
+    if (!activeResearch.has(callId) || !dc || dc.readyState !== "open") return;
+    const now = Date.now();
+    const lastSpokenUpdate = Math.max(lastNarrationTs, lastProgressCueTs);
+    if (now - lastSpokenUpdate < 55_000) return;
+    lastProgressCueTs = now;
+    requestResponse({
+      conversation: "none",
+      output_modalities: ["audio"],
+      instructions:
+        `Give ${operatorName} a very brief progress cue: you're still working on it and will report back when there is a result or useful update. ` +
+        `Do not estimate a duration unless you know it. Do not say it will take a minute. Keep it to one short sentence.`,
+    });
+  }, 60_000);
 
   function injectMilestone(section, text) {
     if (!dc || dc.readyState !== "open") return;
@@ -1187,6 +1207,7 @@ async function handleDeepResearch(callId, args) {
       //    updates so longer researches don't get chatty.
       if (now - lastNarrationTs >= 10000) {
         lastNarrationTs = now;
+        lastProgressCueTs = now;
         requestResponse({
           conversation: "none",
           output_modalities: ["audio"],
@@ -1245,6 +1266,7 @@ async function handleDeepResearch(callId, args) {
       // function_call_output and closed the chip. Don't send a second output
       // (double output → invalid_request_error) or paint a bubble.
       clearInterval(chipTimer);
+      clearInterval(progressCueTimer);
       return;
     }
     status = "error";
@@ -1252,6 +1274,7 @@ async function handleDeepResearch(callId, args) {
     assembled = `Agent is temporarily unreachable - ${e.message || e}`;
   } finally {
     clearInterval(chipTimer);
+    clearInterval(progressCueTimer);
     closeConsultingChip(callId);
   }
   // Single arbiter for the function_call_output: whoever wins the atomic
