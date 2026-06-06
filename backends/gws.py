@@ -177,6 +177,9 @@ async def calendar(when: str | None = None, account: str | None = None) -> list[
             "start": _fmt_hhmm(start.get("dateTime") or start.get("date") or "", tz),
             "end": _fmt_hhmm(end.get("dateTime") or end.get("date") or "", tz),
             "title": ev.get("summary") or "(no title)",
+            "location": ev.get("location") or "",
+            "description": (ev.get("description") or "")[:700],
+            "link": ev.get("htmlLink") or "",
             "attendees": attendees[:10],
         })
     return out
@@ -186,36 +189,84 @@ async def calendar(when: str | None = None, account: str | None = None) -> list[
 
 async def gmail_search(query: str, account: str | None = None,
                        limit: int = 10) -> list[dict] | dict:
-    """Search messages on the given account. Shape: [{from, subject, snippet, ts}]."""
+    """Search Gmail.
+
+    When `account` is omitted, fan out across all configured accounts and return
+    the newest matches globally. Voice users often say "check my inbox" while
+    meaning "personal or Crunchy"; searching only DEFAULT_ACCOUNT caused false
+    negative answers even though the message existed in another configured inbox.
+
+    Shape: [{account, from, subject, snippet, ts}].
+    """
     if not query or not query.strip():
         return {"error": "empty_query"}
-    acct = account or DEFAULT_ACCOUNT
-    if (err := _check_account(acct)) is not None:
-        return err
-    list_params = {"userId": "me", "q": query.strip(), "maxResults": int(max(1, min(limit, 25)))}
-    listed = await _run_gws(acct, ["gmail", "users", "messages", "list",
-                                   "--params", json.dumps(list_params)])
-    if listed is None:
-        return {"error": "gws_unavailable"}
-    messages = listed.get("messages") if isinstance(listed, dict) else None
-    if not isinstance(messages, list) or not messages:
-        return []
-    # Hydrate each message's headers in parallel via separate wrapper calls.
-    async def _hydrate(mid: str) -> dict | None:
-        gparams = {"userId": "me", "id": mid, "format": "metadata",
-                   "metadataHeaders": ["From", "Subject", "Date"]}
-        raw = await _run_gws(acct, ["gmail", "users", "messages", "get",
-                                    "--params", json.dumps(gparams)],
-                             timeout_s=6.0)
-        if not isinstance(raw, dict):
-            return None
-        headers = {h.get("name", "").lower(): h.get("value", "")
-                   for h in (raw.get("payload", {}).get("headers") or [])}
-        return {
-            "from": headers.get("from", ""),
-            "subject": headers.get("subject", ""),
-            "snippet": (raw.get("snippet") or "")[:300],
-            "ts": headers.get("date") or raw.get("internalDate"),
-        }
-    out = await asyncio.gather(*[_hydrate(m["id"]) for m in messages if m.get("id")])
-    return [m for m in out if m]
+    max_results = int(max(1, min(limit, 25)))
+    q = query.strip()
+
+    if account:
+        accounts = [account]
+    else:
+        # Stable order: default first for backwards-compatible latency/logs, then
+        # the rest alphabetically. The final result is sorted by internalDate.
+        accounts = []
+        if DEFAULT_ACCOUNT:
+            accounts.append(DEFAULT_ACCOUNT)
+        accounts.extend(a for a in sorted(ALLOWED_ACCOUNTS) if a not in accounts)
+    if not accounts:
+        return {"error": "no_configured_accounts"}
+    for acct in accounts:
+        if (err := _check_account(acct)) is not None:
+            return err
+
+    async def _search_account(acct: str) -> list[dict] | dict:
+        list_params = {"userId": "me", "q": q, "maxResults": max_results}
+        listed = await _run_gws(acct, ["gmail", "users", "messages", "list",
+                                       "--params", json.dumps(list_params)])
+        if listed is None:
+            return {"error": "gws_unavailable", "account": acct}
+        messages = listed.get("messages") if isinstance(listed, dict) else None
+        if not isinstance(messages, list) or not messages:
+            return []
+
+        # Hydrate each message's headers in parallel via separate wrapper calls.
+        async def _hydrate(mid: str) -> dict | None:
+            gparams = {"userId": "me", "id": mid, "format": "metadata",
+                       "metadataHeaders": ["From", "Subject", "Date"]}
+            raw = await _run_gws(acct, ["gmail", "users", "messages", "get",
+                                        "--params", json.dumps(gparams)],
+                                 timeout_s=6.0)
+            if not isinstance(raw, dict):
+                return None
+            headers = {h.get("name", "").lower(): h.get("value", "")
+                       for h in (raw.get("payload", {}).get("headers") or [])}
+            internal_ms = 0
+            try:
+                internal_ms = int(raw.get("internalDate") or 0)
+            except (TypeError, ValueError):
+                internal_ms = 0
+            return {
+                "account": acct,
+                "from": headers.get("from", ""),
+                "subject": headers.get("subject", ""),
+                "snippet": (raw.get("snippet") or "")[:300],
+                "ts": headers.get("date") or raw.get("internalDate"),
+                "_internal_ms": internal_ms,
+            }
+        hydrated = await asyncio.gather(*[_hydrate(m["id"]) for m in messages if m.get("id")])
+        return [m for m in hydrated if m]
+
+    searched = await asyncio.gather(*[_search_account(acct) for acct in accounts])
+    errors = [r for r in searched if isinstance(r, dict) and r.get("error")]
+    rows: list[dict] = []
+    for result in searched:
+        if isinstance(result, list):
+            rows.extend(result)
+
+    if not rows and errors:
+        return {"error": "gws_unavailable", "accounts": [e.get("account") for e in errors]}
+
+    rows.sort(key=lambda m: int(m.get("_internal_ms") or 0), reverse=True)
+    out = rows[:max_results]
+    for row in out:
+        row.pop("_internal_ms", None)
+    return out

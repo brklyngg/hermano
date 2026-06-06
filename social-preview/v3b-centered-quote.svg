@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+  <rect width="1280" height="640" fill="#0d1117"/>
+
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <!-- Wordmark centered with inline voice-on indicator to the left. -->
+    <g transform="translate(330, 320)">
+      <g transform="translate(26, -38)">
+        <circle r="10" fill="#7ee787"/>
+        <circle r="20" fill="none" stroke="#7ee787" stroke-width="2" opacity="0.45"/>
+        <circle r="32" fill="none" stroke="#7ee787" stroke-width="1.5" opacity="0.2"/>
+      </g>
+      <text x="80" y="0" font-weight="800" font-size="112" fill="#f0f6fc" letter-spacing="-4">Hermano</text>
+    </g>
+
+    <!-- tagline -->
+    <text x="640" y="380" text-anchor="middle" font-weight="500" font-size="26" fill="#8b949e">A live, interruptible voice line to your agent.</text>
+
+    <!-- subtle capability line -->
+    <text x="640" y="432" text-anchor="middle" font-weight="600" font-size="14" fill="#6e7681" letter-spacing="4">DEEP CONTEXT   ·   AGENTIC ACTIONS</text>
+  </g>
+</svg>

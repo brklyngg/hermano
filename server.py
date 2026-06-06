@@ -254,8 +254,9 @@ CALENDAR_SCHEMA = {
     "name": "calendar",
     "description": (
         "Read calendar events for a window. Use for 'what's on for today', "
-        "'tomorrow's meetings', or specific dates. Always prefer this over "
-        "`deep_research` for scheduling questions."
+        "'tomorrow's meetings', event venue/details, or specific dates. Returns "
+        "time/title/location/description/link when Calendar has them. Always "
+        "prefer this over `deep_research` for scheduling questions."
     ),
     "parameters": {
         "type": "object",
@@ -281,8 +282,10 @@ GMAIL_SEARCH_SCHEMA = {
     "name": "gmail_search",
     "description": (
         "Search Gmail with a query. Use Gmail's native search syntax "
-        "(`from:foo`, `subject:bar`, `newer_than:3d`). Returns top messages "
-        "with from/subject/snippet."
+        "(`from:foo`, `subject:bar`, `newer_than:3d`). If the user says the "
+        "message may be in any inbox, omit `account` so the backend fans out "
+        "across all configured accounts. Returns top messages with "
+        "account/from/subject/snippet."
     ),
     "parameters": {
         "type": "object",

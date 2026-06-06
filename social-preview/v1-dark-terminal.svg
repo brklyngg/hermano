@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+  <defs>
+    <linearGradient id="bg1" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d1117"/>
+      <stop offset="1" stop-color="#161b22"/>
+    </linearGradient>
+    <linearGradient id="accent1" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#7ee787"/>
+      <stop offset="1" stop-color="#58a6ff"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="640" fill="url(#bg1)"/>
+
+  <!-- Subtle grid -->
+  <g stroke="#21262d" stroke-width="1" opacity="0.5">
+    <path d="M0 160 H1280 M0 320 H1280 M0 480 H1280"/>
+    <path d="M320 0 V640 M640 0 V640 M960 0 V640"/>
+  </g>
+
+  <!-- Waveform -->
+  <g transform="translate(80, 320)" stroke="url(#accent1)" stroke-width="4" stroke-linecap="round" fill="none">
+    <path d="M0 0 L0 -10 M20 0 L20 -28 M40 0 L40 -60 M60 0 L60 -90 M80 0 L80 -50 M100 0 L100 -20 M120 0 L120 -70 M140 0 L140 -110 M160 0 L160 -45 M180 0 L180 -15"/>
+    <path d="M0 0 L0 10 M20 0 L20 28 M40 0 L40 60 M60 0 L60 90 M80 0 L80 50 M100 0 L100 20 M120 0 L120 70 M140 0 L140 110 M160 0 L160 45 M180 0 L180 15"/>
+  </g>
+
+  <!-- Title -->
+  <text x="80" y="200" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-weight="800" font-size="120" fill="#f0f6fc" letter-spacing="-3">Hermano</text>
+
+  <!-- Tagline -->
+  <text x="80" y="270" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-weight="500" font-size="32" fill="#8b949e">A live, interruptible voice line to your own agent.</text>
+
+  <!-- Code block style hint -->
+  <g transform="translate(80, 460)">
+    <rect width="1120" height="100" rx="12" fill="#161b22" stroke="#30363d"/>
+    <text x="24" y="44" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22" fill="#7ee787">browser</text>
+    <text x="138" y="44" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22" fill="#8b949e">↔</text>
+    <text x="170" y="44" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22" fill="#58a6ff">OpenAI Realtime</text>
+    <text x="416" y="44" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22" fill="#8b949e">↔</text>
+    <text x="448" y="44" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22" fill="#d2a8ff">sidecar</text>
+    <text x="562" y="44" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22" fill="#8b949e">↔</text>
+    <text x="594" y="44" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22" fill="#ffa657">your context</text>
+    <text x="24" y="78" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" fill="#6e7681">grounded in today's open loops, calendar, notes, decisions — from second 1.</text>
+  </g>
+</svg>
