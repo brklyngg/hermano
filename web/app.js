@@ -228,6 +228,10 @@ const TOOL_CHIPS = {
   mission_control_card: { idle: "Pulling that card…",           key: "id" },
   recall_recent_call:   { idle: "Pulling up that earlier call…", key: "query", prefix: "Recalling: " },
   deep_research:        { idle: "Researching…",                 key: "prompt", prefix: "Researching: " },
+  describe_sheet:       { idle: "Checking the sheet layout…" },
+  read_cells:           { idle: "Reading the sheet…",           key: "range", prefix: "Sheet: " },
+  write_cells:          { idle: "Updating the sheet…" },
+  drive_search:         { idle: "Finding that file…",           key: "query", prefix: "Drive: " },
 };
 
 // Pull a string arg value from a partial-JSON args buffer. Args stream in
@@ -1068,6 +1072,7 @@ const NARROW_TOOLS = new Set([
   "lookup_open_loop", "recent_decisions", "search_notes",
   "calendar", "gmail_search", "mission_control_card",
   "recall_recent_call",
+  "describe_sheet", "read_cells", "write_cells", "drive_search",
 ]);
 
 function dispatchToolCall(callId, name, args) {
@@ -1338,9 +1343,26 @@ function formatToolResultForBubble(name, args, result) {
         `- ${d.date} — **${d.decision}**${d.context ? ` — _${d.context}_` : ""}`
       ).join("\n");
     }
+    if (name === "drive_search") {
+      return `**Drive (${result.length}):**\n` + result.map(f =>
+        `- **${f.name}** _(${f.type})_ — \`${f.id}\``
+      ).join("\n");
+    }
   }
-  // Single-object tools (lookup_open_loop, mission_control_card)
+  // Single-object tools (lookup_open_loop, mission_control_card, sheets)
   if (result && typeof result === "object") {
+    if (name === "read_cells" && Array.isArray(result.values)) {
+      const rows = result.values.slice(0, 12).map(r => (r || []).join(" | ")).join("\n");
+      return `**${result.range || "cells"}:**\n\`\`\`\n${rows}\n\`\`\``;
+    }
+    if (name === "describe_sheet" && Array.isArray(result.tabs)) {
+      return `**${result.title || "Sheet"}** — tabs: ` +
+        result.tabs.map(t => `\`${t.title}\``).join(", ");
+    }
+    if (name === "write_cells" && result.ok) {
+      return `**Sheet updated** — ${result.updated_cells ?? "?"} cell(s)` +
+        (result.updated_ranges?.length ? ` (${result.updated_ranges.join(", ")})` : "");
+    }
     if (result.title) {
       const parts = [`**${result.title}**`];
       if (result.column) parts.push(`column: \`${result.column}\``);

@@ -19,6 +19,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import secrets
 import sys
 import time
@@ -415,6 +416,121 @@ RECALL_RECENT_CALL_SCHEMA = {
     },
 }
 
+DESCRIBE_SHEET_SCHEMA = {
+    "type": "function",
+    "name": "describe_sheet",
+    "description": (
+        "List a Google Sheet's tab names and dimensions. Call this first to "
+        "learn the layout before reading or writing, so you target the right "
+        "cells. Returns {title, tabs:[{title, rows, cols}]}."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "spreadsheet_id": {
+                "type": "string",
+                "description": "The spreadsheet ID (from its URL or from drive_search).",
+            },
+            "account": {"type": "string", "description": _gws_account_desc()},
+        },
+        "required": ["spreadsheet_id"],
+    },
+}
+
+READ_CELLS_SCHEMA = {
+    "type": "function",
+    "name": "read_cells",
+    "description": (
+        "Read a range of cells from a Google Sheet. Use to see current values "
+        "before editing, or to answer a question about the sheet. Prefer this "
+        "over `deep_research` for reading a spreadsheet — it's sub-second. "
+        "Returns {range, values} where values is a 2D array of rows."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "spreadsheet_id": {
+                "type": "string",
+                "description": "The spreadsheet ID (from its URL, describe_sheet, or drive_search).",
+            },
+            "range": {
+                "type": "string",
+                "description": "A1 notation, e.g. 'Sheet1!A1:D10', 'Data!B2', or 'A1:C1'.",
+            },
+            "account": {"type": "string", "description": _gws_account_desc()},
+        },
+        "required": ["spreadsheet_id", "range"],
+    },
+}
+
+WRITE_CELLS_SCHEMA = {
+    "type": "function",
+    "name": "write_cells",
+    "description": (
+        "Write values to one or more cell ranges in a Google Sheet in a single "
+        "batch. Prefer this over `deep_research` for editing a spreadsheet — "
+        "it's sub-second. BATCH multiple cell changes into ONE call by composing "
+        "the full `edits` list rather than calling this repeatedly. Read or "
+        "describe the sheet first to confirm the target cells. Values use "
+        "USER_ENTERED (formulas, numbers, dates behave as if typed in the UI). "
+        "Returns {ok, updated_cells, updated_ranges}."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "spreadsheet_id": {
+                "type": "string",
+                "description": "The spreadsheet ID (from its URL, describe_sheet, or drive_search).",
+            },
+            "edits": {
+                "type": "array",
+                "description": (
+                    "One or more range edits applied together. Each item is "
+                    "{range: A1 like 'Sheet1!B2:C3', values: array of rows}."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "range": {
+                            "type": "string",
+                            "description": "A1 notation for this edit, e.g. 'Sheet1!B2' or 'Data!A1:C1'.",
+                        },
+                        "values": {
+                            "type": "array",
+                            "description": "Rows of cell values (array of arrays; a single row may be a flat array).",
+                            "items": {"type": "array"},
+                        },
+                    },
+                    "required": ["range", "values"],
+                },
+            },
+            "account": {"type": "string", "description": _gws_account_desc()},
+        },
+        "required": ["spreadsheet_id", "edits"],
+    },
+}
+
+DRIVE_SEARCH_SCHEMA = {
+    "type": "function",
+    "name": "drive_search",
+    "description": (
+        "Find a Google Drive file (Doc, Sheet, Slides, folder) by name or "
+        "content. Use to locate a document or spreadsheet the user references "
+        "but whose ID you don't have (e.g. 'the sheet we were working in "
+        "yesterday'). Returns [{id, name, type, modified, link}] newest-first; "
+        "use the returned `id` as the spreadsheet_id for read_cells/write_cells."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Words from the file name or its contents."},
+            "account": {"type": "string", "description": _gws_account_desc()},
+            "limit": {"type": "integer", "description": "Max results (1–25)", "default": 10},
+        },
+        "required": ["query"],
+    },
+}
+
 _ALL_TOOLKIT_SCHEMAS = [
     LOOKUP_OPEN_LOOP_SCHEMA,
     RECENT_DECISIONS_SCHEMA,
@@ -423,6 +539,10 @@ _ALL_TOOLKIT_SCHEMAS = [
     GMAIL_SEARCH_SCHEMA,
     MISSION_CONTROL_CARD_SCHEMA,
     RECALL_RECENT_CALL_SCHEMA,
+    DESCRIBE_SHEET_SCHEMA,
+    READ_CELLS_SCHEMA,
+    WRITE_CELLS_SCHEMA,
+    DRIVE_SEARCH_SCHEMA,
     DEEP_RESEARCH_TOOL_SCHEMA,
     CANCEL_RESEARCH_TOOL_SCHEMA,
 ]
@@ -566,7 +686,12 @@ previous call. ADDRESS IT DIRECTLY — don't re-fetch what's already there.
 
 TOOLKIT:
 - Narrow read tools (sub-second): `lookup_open_loop`, `recent_decisions`,
-  `search_notes`, `calendar`, `gmail_search`, `mission_control_card`.
+  `search_notes`, `calendar`, `gmail_search`, `mission_control_card`,
+  `drive_search` (find a Doc/Sheet by name or content).
+- Google Sheets (sub-second, direct): `describe_sheet` (tab layout),
+  `read_cells` (read a range), `write_cells` (edit one or many ranges in one
+  batch). Use these for spreadsheet work — never route sheet reads/edits
+  through `deep_research`.
 - One slow tool: `deep_research` — covers BOTH (a) novel reasoning,
   drafting, synthesis, AND (b) any ACTION with side effects: write/save
   files, draft and save emails, create calendar events, edit notes, run
@@ -580,8 +705,17 @@ TOOL-CALL DOCTRINE:
    `deep_research`.
 2. Any user request that requires *doing* something (saving a file,
    drafting an email and saving it, creating a calendar event, editing
-   a note, etc.) goes through `deep_research` with scope="action". The
+   a note, etc.) goes through `deep_research` with scope="action" — EXCEPT
+   Google Sheets edits, which use the direct `write_cells` tool (see 2b). The
    agent will perform the action and return a concrete handle.
+2b. SPREADSHEETS: to read or edit a Google Sheet, use the direct tools, not
+   `deep_research` (they're sub-second; deep_research is 30–120s). Find the
+   sheet with `drive_search` if you don't have its ID; use `describe_sheet` /
+   `read_cells` to see the layout and current values; then `write_cells` to
+   edit. BATCH multiple cell changes into ONE `write_cells` call (compose the
+   full `edits` list) instead of many. Always read/describe before writing to
+   confirm you're targeting the right cells. `write_cells` returns updated
+   ranges/cell counts — that's your handle for a "done" confirmation (rule 10).
 3. Fan out small tools in parallel when a single turn needs multiple
    lookups. The API supports it — don't serialize "let me check your
    calendar… ok now let me check your email."
@@ -1159,6 +1293,10 @@ _ALL_TOOL_DISPATCH = {
     "calendar":             ("backends.gws",                "calendar"),
     "gmail_search":         ("backends.gws",                "gmail_search"),
     "recall_recent_call":   ("backends.transcripts_recall", "recall_recent_call"),
+    "describe_sheet":       ("backends.sheets",             "describe_sheet"),
+    "read_cells":           ("backends.sheets",             "read_cells"),
+    "write_cells":          ("backends.sheets",             "write_cells"),
+    "drive_search":         ("backends.gws",                "drive_search"),
 }
 
 # Per-tool cache TTLs (seconds). Calendar and Gmail need shorter windows so
@@ -1172,7 +1310,17 @@ _ALL_TOOL_TTL = {
     "recent_decisions": 300.0,
     "search_notes": 300.0,
     "recall_recent_call": 300.0,
+    "describe_sheet": 30.0,
+    "drive_search": 60.0,
 }
+
+# Tools that must NEVER be memoized. Mutating writes (`write_cells`) must
+# actually re-execute when re-issued — a cache hit would silently no-op a
+# legitimate re-write. Live reads used in the write→verify loop (`read_cells`)
+# must reflect the just-written state — a cached read would return stale
+# pre-write values. The 300s default TTL in cache.memoize would otherwise mask
+# both, so these bypass the cache entirely in tool_dispatch.
+_NO_CACHE = {"read_cells", "write_cells"}
 
 
 def _build_toolkit() -> tuple[list, dict, dict]:
@@ -1210,7 +1358,10 @@ def _build_toolkit() -> tuple[list, dict, dict]:
     try:
         from backends.gws import ALLOWED_ACCOUNTS as _gws_accounts, GWS_WRAPPER as _gws_wrapper
         if _gws_accounts and _gws_wrapper.exists():
-            available.update({"calendar", "gmail_search"})
+            available.update({
+                "calendar", "gmail_search",
+                "describe_sheet", "read_cells", "write_cells", "drive_search",
+            })
     except Exception:  # noqa: BLE001
         pass
     schemas = [s for s in _ALL_TOOLKIT_SCHEMAS if s["name"] in available]
@@ -1259,10 +1410,16 @@ async def tool_dispatch(request: web.Request) -> web.Response:
         from importlib import import_module
         mod = import_module(module_name)
         fn = getattr(mod, fn_name)
-        from backends import cache
-        result, cache_hit = await cache.memoize(
-            name, args, lambda: fn(**args), ttl_sec=_TOOL_TTL.get(name),
-        )
+        if name in _NO_CACHE:
+            # Never memoize mutating writes or the live reads used to verify
+            # them (see _NO_CACHE) — run the backend directly.
+            result = await fn(**args)
+            cache_hit = False
+        else:
+            from backends import cache
+            result, cache_hit = await cache.memoize(
+                name, args, lambda: fn(**args), ttl_sec=_TOOL_TTL.get(name),
+            )
     except TypeError as e:
         # Bad args (missing required, wrong types). Surface to the model as a
         # structured error so it can re-call with the right shape.
@@ -1738,18 +1895,59 @@ async def _start_reaper(app: web.Application) -> None:
     app["reaper_task"] = asyncio.create_task(_reap_stale_conversations())
 
 
-async def _start_dossier_refresh(app: web.Application) -> None:
-    """Fire-and-forget dossier refresh at server boot.
+DOSSIER_REFRESH_INTERVAL_SEC = float(os.getenv("DOSSIER_REFRESH_INTERVAL_SEC", "2400"))  # 40 min
 
-    Never blocks startup — mint reads whatever's on disk and gracefully
-    skips when stale, so a slow agent backend at boot doesn't keep the
-    server from accepting calls.
+
+async def _dossier_refresh_loop() -> None:
+    """Boot + periodic dossier refresh.
+
+    The gateway (:8642) and this service start together under launchd, so the
+    boot refresh often races ahead of the gateway being ready — every attempt
+    then fails with a connect error and the on-disk dossier freezes (observed
+    stuck 13 days). Retry a few times with short backoff to catch the gateway
+    coming up, then settle into a periodic cadence that also self-heals long
+    no-call staleness (refresh otherwise only fires at boot + post-call).
+
+    Never blocks startup — mint reads whatever's on disk and gracefully skips
+    when stale, so a slow agent backend at boot doesn't keep the server from
+    accepting calls.
     """
     if not AGENT_API_KEY:
         return
-    asyncio.create_task(
-        dossier.refresh_dossier(agent_base=AGENT_API_BASE, agent_key=AGENT_API_KEY)
-    )
+    # Boot: short retries to ride out gateway startup (refresh_dossier returns
+    # None on a failed agent call, the existing dossier on a debounced no-op).
+    for delay in (0, 5, 15, 30):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            if await dossier.refresh_dossier(agent_base=AGENT_API_BASE, agent_key=AGENT_API_KEY) is not None:
+                break
+        except Exception:  # noqa: BLE001
+            log.exception("boot dossier refresh failed")
+    # Periodic: force=False respects the 30-min debounce, so this is a cheap
+    # no-op right after a call refreshed and a real refresh once stale.
+    while True:
+        interval = DOSSIER_REFRESH_INTERVAL_SEC
+        await asyncio.sleep(interval + random.uniform(-0.1, 0.1) * interval)
+        try:
+            await dossier.refresh_dossier(agent_base=AGENT_API_BASE, agent_key=AGENT_API_KEY)
+        except Exception:  # noqa: BLE001
+            log.exception("periodic dossier refresh failed")
+
+
+async def _start_dossier_refresh(app: web.Application) -> None:
+    """Start the boot+periodic dossier refresh loop as a background task."""
+    app["dossier_task"] = asyncio.create_task(_dossier_refresh_loop())
+
+
+async def _stop_dossier_refresh(app: web.Application) -> None:
+    task = app.get("dossier_task")
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 async def _stop_reaper(app: web.Application) -> None:
@@ -1821,6 +2019,7 @@ def make_app() -> web.Application:
     app.on_startup.append(_start_reaper)
     app.on_startup.append(_start_dossier_refresh)
     app.on_cleanup.append(_stop_reaper)
+    app.on_cleanup.append(_stop_dossier_refresh)
     app.router.add_get("/api/health", health)
     app.router.add_post("/api/session", session_mint)
     # Legacy `/api/ask-agent` is hard-cut to 410 so stale PWA caches can't

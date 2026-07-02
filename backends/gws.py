@@ -270,3 +270,87 @@ async def gmail_search(query: str, account: str | None = None,
     for row in out:
         row.pop("_internal_ms", None)
     return out
+
+
+# ---- drive ----
+
+_DRIVE_TYPE = {
+    "application/vnd.google-apps.spreadsheet": "sheet",
+    "application/vnd.google-apps.document": "doc",
+    "application/vnd.google-apps.presentation": "slides",
+    "application/vnd.google-apps.folder": "folder",
+    "application/pdf": "pdf",
+}
+
+
+async def drive_search(query: str, account: str | None = None,
+                       limit: int = 10) -> list[dict] | dict:
+    """Find Drive files (Docs, Sheets, Slides, folders) by name or full-text.
+
+    Locates a document/spreadsheet the user references but whose ID we don't
+    have ("the sheet we were working in yesterday"). When `account` is omitted,
+    fans out across all configured accounts and merges newest-first — Gary's
+    files live across four accounts and he rarely remembers which. Returns
+    [{id, name, type, modified, link, account}].
+    """
+    if not query or not query.strip():
+        return {"error": "empty_query"}
+    max_results = int(max(1, min(limit, 25)))
+    # Drop single quotes so they can't break the Drive query string.
+    q = query.strip().replace("'", " ")
+    drive_q = f"(name contains '{q}' or fullText contains '{q}') and trashed = false"
+
+    if account:
+        accounts = [account]
+    else:
+        accounts = []
+        if DEFAULT_ACCOUNT:
+            accounts.append(DEFAULT_ACCOUNT)
+        accounts.extend(a for a in sorted(ALLOWED_ACCOUNTS) if a not in accounts)
+    if not accounts:
+        return {"error": "no_configured_accounts"}
+    for acct in accounts:
+        if (err := _check_account(acct)) is not None:
+            return err
+
+    async def _search_account(acct: str) -> list[dict] | dict:
+        params = {
+            "q": drive_q,
+            "pageSize": max_results,
+            "fields": "files(id,name,mimeType,modifiedTime,webViewLink)",
+            "orderBy": "modifiedTime desc",
+        }
+        raw = await _run_gws(acct, ["drive", "files", "list",
+                                    "--params", json.dumps(params)])
+        if raw is None:
+            return {"error": "gws_unavailable", "account": acct}
+        files = raw.get("files") if isinstance(raw, dict) else None
+        if not isinstance(files, list):
+            return []
+        rows: list[dict] = []
+        for f in files:
+            mime = f.get("mimeType", "")
+            rows.append({
+                "id": f.get("id"),
+                "name": f.get("name"),
+                "type": _DRIVE_TYPE.get(mime, mime.rsplit(".", 1)[-1] if "." in mime else mime),
+                "modified": f.get("modifiedTime"),
+                "link": f.get("webViewLink"),
+                "account": acct,
+                "_mt": f.get("modifiedTime") or "",
+            })
+        return rows
+
+    searched = await asyncio.gather(*[_search_account(a) for a in accounts])
+    errors = [r for r in searched if isinstance(r, dict) and r.get("error")]
+    rows: list[dict] = []
+    for result in searched:
+        if isinstance(result, list):
+            rows.extend(result)
+    if not rows and errors:
+        return {"error": "gws_unavailable", "accounts": [e.get("account") for e in errors]}
+    rows.sort(key=lambda x: x.get("_mt") or "", reverse=True)
+    out = rows[:max_results]
+    for row in out:
+        row.pop("_mt", None)
+    return out
