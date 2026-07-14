@@ -50,3 +50,4 @@ Thumbs.db
 
 # Internal harness session log (workflow patterns, not for public)
 EVOLVE.md
+context/
